@@ -5,3 +5,9 @@
 [submodule "BLEd/bluez"]
 	path = BLEd/bluez
 	url = https://git.kernel.org/pub/scm/bluetooth/bluez.git
+[submodule "BLEd/libconfig"]
+	path = BLEd/libconfig
+	url = https://github.com/hyperrealm/libconfig.git
+[submodule "BLEd/protobuf"]
+	path = BLEd/protobuf
+	url = https://github.com/protocolbuffers/protobuf.git
