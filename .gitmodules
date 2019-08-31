@@ -1,0 +1,4 @@
+[submodule "linux_tools"]
+	path = linux_tools
+	url = https://github.com/raspberrypi/tools
+

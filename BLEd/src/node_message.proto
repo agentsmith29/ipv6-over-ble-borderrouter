@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package BLEd_message;
+
+message NodeConnectionInfo {
+  int32 handle = 1;
+  int32 type = 2;
+  int32 out = 3;
+  int32 state = 4;
+  int32 link_mode = 5;
+}
+
+message NodeConnnectionParameters {
+  int32 conn_interval_min = 1;
+  int32 conn_interval_max = 2;
+  int32 conn_latency = 3;
+  int32 supervision_timeout = 4;
+  int32 minimum_ce_length = 5;
+  int32 maximum_ce_length = 6;
+}
+
+message Node {
+  string hw_address = 1;  
+  int32 hw_address_type = 2;
+  int32 connection_state = 3;
+
+  string name = 4;
+  string ipv6_address = 5;
+  string localLinkAddress = 6;
+
+  NodeConnectionInfo conn_info = 7;
+  NodeConnnectionParameters conn_parameter = 8;
+}
+
+message NodesList {
+  repeated Node conn_nodes = 1;
+}

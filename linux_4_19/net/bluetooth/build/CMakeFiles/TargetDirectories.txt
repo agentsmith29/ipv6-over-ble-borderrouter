@@ -1,0 +1,3 @@
+/home/developer/workspace/IPv6-BLE-Router/linux/net/bluetooth/build/CMakeFiles/rebuild_cache.dir
+/home/developer/workspace/IPv6-BLE-Router/linux/net/bluetooth/build/CMakeFiles/scantest.dir
+/home/developer/workspace/IPv6-BLE-Router/linux/net/bluetooth/build/CMakeFiles/edit_cache.dir

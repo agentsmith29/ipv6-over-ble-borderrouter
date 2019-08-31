@@ -1,0 +1,13 @@
+[Unit]
+Description=My 6lowpan helper
+
+[Service]
+Type=simple
+#ExecStart=/usr/bin/valgrind --tool=memcheck --leak-check=full --log-file=/home/pi/BLEd.log  /usr/bin/BLEd
+#ExecStart=/usr/bin/valgrind --tool=helgrind --log-file=/home/pi/BLEd.log  /usr/bin/BLEd
+#ExecStart=/usr/bin/BLEd
+#ExecStart= /usr/bin/gdbserver :1234 /usr/bin/BLEd
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
