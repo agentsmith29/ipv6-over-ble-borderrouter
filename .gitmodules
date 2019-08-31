@@ -2,3 +2,6 @@
 	path = linux_tools
 	url = https://github.com/raspberrypi/tools
 
+[submodule "BLEd/bluez"]
+	path = BLEd/bluez
+	url = https://git.kernel.org/pub/scm/bluetooth/bluez.git

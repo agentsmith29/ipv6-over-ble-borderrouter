@@ -34,32 +34,53 @@
 
 
 
-
-# Normal rules
+#
+# NOTE! Don't add files that are generated in specific
+# subdirectories here. Add them in the ".gitignore" file
+# in that subdirectory instead.
+#
+# NOTE! Please use 'git ls-files -i --exclude-standard'
+# command after changing this file, to see if there are
+# any tracked files which get ignored after the change.
+#
+# Normal rules (sorted alphabetically)
 #
 .*
+*.a
+*.asn1.[ch]
+*.bin
+*.bz2
+*.c.[012]*.*
+*.dtb
+*.dtbo
+*.dtb.S
+*.dwo
+*.elf
+*.gcno
+*.gz
+*.i
+*.ko
+*.lex.c
+*.ll
+*.lst
+*.lz4
+*.lzma
+*.lzo
+*.mod.c
 *.o
 *.o.*
-*.a
+*.order
+*.patch
 *.s
-*.ko
 *.so
 *.so.dbg
-*.mod.c
-*.i
-*.lst
+*.su
 *.symtypes
-*.order
-modules.builtin
-*.elf
-*.bin
-*.gz
-*.bz2
-*.lzma
+*.tab.[ch]
+*.tar
 *.xz
-*.lzo
-*.patch
-*.gcno
+Module.symvers
+modules.builtin
 
 #
 # Top-level generic files
@@ -68,10 +89,16 @@ modules.builtin
 /TAGS
 /linux
 /vmlinux
+/vmlinux.32
+/vmlinux-gdb.py
 /vmlinuz
 /System.map
 /Module.markers
-Module.symvers
+
+#
+# RPM spec file (make rpm-pkg)
+#
+/*.spec
 
 #
 # Debian directory (make deb-pkg)
@@ -79,17 +106,29 @@ Module.symvers
 /debian/
 
 #
-# git files that we don't want to ignore even it they are dot-files
+# Snap directory (make snap-pkg)
+#
+/snap/
+
+#
+# tar directory (make tar*-pkg)
+#
+/tar-install/
+
+#
+# git files that we don't want to ignore even if they are dot-files
 #
 !.gitignore
 !.mailmap
+!.cocciconfig
+!.clang-format
 
 #
 # Generated include files
 #
 include/config
-include/linux/version.h
 include/generated
+include/ksym
 arch/*/include/generated
 
 # stgit generated dirs
@@ -109,6 +148,9 @@ GRTAGS
 GSYMS
 GTAGS
 
+# id-utils files
+ID
+
 *.orig
 *~
 \#*#
@@ -116,6 +158,17 @@ GTAGS
 #
 # Leavings from module signing
 #
+extra_certificates
+signing_key.pem
+signing_key.priv
+signing_key.x509
+x509.genkey
+
+# Kconfig presets
+all.config
+
+# Kdevelop4
+*.kdev4
 extra_certificates
 signing_key.priv
 signing_key.x509
