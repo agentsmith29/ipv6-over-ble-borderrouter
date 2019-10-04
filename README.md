@@ -26,7 +26,28 @@ build configuration
 ```bash
 ./kernelConfig.sh
 ```
+A configuration page should open up now. Under  `Networking support -> Bluetooth subsystem support -> Bluetooth Low Energy (LE) features` make sure 
+`Bluetooth 6LoWPAN support` is marked with an 'M'.
 
+Example:
+
+```bash
+[*] Networking support
+      <M> Bluetooth subsystem support
+        [*]   Bluetooth Classic (BR/EDR) features
+    <M>     RFCOMM protocol support
+    [*]       RFCOMM TTY support
+    <M>     BNEP protocol support
+    [*]       Multicast filter
+    [*]       Protocol filter support
+    <M>     CMTP protocol support
+    <M>     HIDP protocol support
+    [*]     Bluetooth High Speed (HS) features
+    [*]  Bluetooth Low Energy (LE) features 
+    <M>     Bluetooth 6LoWPAN support
+    [ ]   Bluetooth self testing support
+    [*]   Export Bluetooth internals in debugf
+   ```    
 ## Building
 
 ```bash
@@ -49,8 +70,9 @@ Possible output
    sdb
      sdb1
      sdb2`
-``
-If sdb is you sd-card, call the script with the following parameter
+```
+
+If `sdb` is you sd-card, call the script with the following parameter
 
 ```bash
 ./copy2sd.sh sdb
