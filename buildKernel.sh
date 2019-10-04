@@ -1,7 +1,10 @@
 #!/bin/bash
 cd ./linux_4_19
 
-#make clean
+# make clean
+
+# For fixing the "command not found" error while running with sudo!
+PATH="$PATH:./../linux_tools/arm-bcm2708/gcc-linaro-arm-linux-gnueabihf-raspbian-x64/bin"
 
 #For Pi 2, Pi 3, Pi 3+, or Compute Module 3:
 KERNEL=kernel7

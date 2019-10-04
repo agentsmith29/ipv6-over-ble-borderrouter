@@ -23,7 +23,7 @@ fi
 
 
 #For fixing the "command not found" error while running with sudo!
-PATH="$PATH:./linux_tools/arm-bcm2708/gcc-linaro-arm-linux-gnueabihf-raspbian-x64/bin"
+PATH="$PATH:./../linux_tools/arm-bcm2708/gcc-linaro-arm-linux-gnueabihf-raspbian-x64/bin"
 
 
 
