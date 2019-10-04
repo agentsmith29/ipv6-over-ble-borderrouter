@@ -130,7 +130,7 @@ struct keyring_search_context {
 	int			skipped_ret;
 	bool			possessed;
 	key_ref_t		result;
-	struct timespec		now;
+	time64_t		now;
 };
 
 extern bool key_default_cmp(const struct key *key,
@@ -169,10 +169,10 @@ extern void key_change_session_keyring(struct callback_head *twork);
 
 extern struct work_struct key_gc_work;
 extern unsigned key_gc_delay;
-extern void keyring_gc(struct key *keyring, time_t limit);
+extern void keyring_gc(struct key *keyring, time64_t limit);
 extern void keyring_restriction_gc(struct key *keyring,
 				   struct key_type *dead_type);
-extern void key_schedule_gc(time_t gc_at);
+extern void key_schedule_gc(time64_t gc_at);
 extern void key_schedule_gc_links(void);
 extern void key_gc_keytype(struct key_type *ktype);
 
@@ -188,20 +188,9 @@ static inline int key_permission(const key_ref_t key_ref, unsigned perm)
 	return key_task_permission(key_ref, current_cred(), perm);
 }
 
-/*
- * Authorisation record for request_key().
- */
-struct request_key_auth {
-	struct key		*target_key;
-	struct key		*dest_keyring;
-	const struct cred	*cred;
-	void			*callout_info;
-	size_t			callout_len;
-	pid_t			pid;
-} __randomize_layout;
-
 extern struct key_type key_type_request_key_auth;
 extern struct key *request_key_auth_new(struct key *target,
+					const char *op,
 					const void *callout_info,
 					size_t callout_len,
 					struct key *dest_keyring);
@@ -211,7 +200,7 @@ extern struct key *key_get_instantiation_authkey(key_serial_t target_id);
 /*
  * Determine whether a key is dead.
  */
-static inline bool key_is_dead(const struct key *key, time_t limit)
+static inline bool key_is_dead(const struct key *key, time64_t limit)
 {
 	return
 		key->flags & ((1 << KEY_FLAG_DEAD) |

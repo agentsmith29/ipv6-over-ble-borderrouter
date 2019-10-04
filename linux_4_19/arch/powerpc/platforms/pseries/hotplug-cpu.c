@@ -234,7 +234,7 @@ static void pseries_cpu_die(unsigned int cpu)
 	 * done here.  Change isolate state to Isolate and
 	 * change allocation-state to Unusable.
 	 */
-	paca[cpu].cpu_start = 0;
+	paca_ptrs[cpu]->cpu_start = 0;
 }
 
 /*
@@ -365,6 +365,8 @@ static int dlpar_online_cpu(struct device_node *dn)
 			BUG_ON(get_cpu_current_state(cpu)
 					!= CPU_STATE_OFFLINE);
 			cpu_maps_update_done();
+			timed_topology_update(1);
+			find_and_online_cpu_nid(cpu);
 			rc = device_online(get_cpu_device(cpu));
 			if (rc)
 				goto out;
@@ -535,6 +537,7 @@ static int dlpar_offline_cpu(struct device_node *dn)
 				set_preferred_offline_state(cpu,
 							    CPU_STATE_OFFLINE);
 				cpu_maps_update_done();
+				timed_topology_update(1);
 				rc = device_offline(get_cpu_device(cpu));
 				if (rc)
 					goto out;
@@ -796,6 +799,25 @@ static int dlpar_cpu_add_by_count(u32 cpus_to_add)
 	}
 
 	kfree(cpu_drcs);
+	return rc;
+}
+
+int dlpar_cpu_readd(int cpu)
+{
+	struct device_node *dn;
+	struct device *dev;
+	u32 drc_index;
+	int rc;
+
+	dev = get_cpu_device(cpu);
+	dn = dev->of_node;
+
+	rc = of_property_read_u32(dn, "ibm,my-drc-index", &drc_index);
+
+	rc = dlpar_cpu_remove_by_index(drc_index);
+	if (!rc)
+		rc = dlpar_cpu_add(drc_index);
+
 	return rc;
 }
 

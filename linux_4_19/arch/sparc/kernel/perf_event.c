@@ -891,6 +891,10 @@ static int sparc_perf_event_set_period(struct perf_event *event,
 	s64 period = hwc->sample_period;
 	int ret = 0;
 
+	/* The period may have been changed by PERF_EVENT_IOC_PERIOD */
+	if (unlikely(period != hwc->last_period))
+		left = period - (hwc->last_period - left);
+
 	if (unlikely(left <= -period)) {
 		left = period;
 		local64_set(&hwc->period_left, left);
@@ -1352,7 +1356,7 @@ static int collect_events(struct perf_event *group, int max_count,
 		events[n] = group->hw.event_base;
 		current_idx[n++] = PIC_NO_INDEX;
 	}
-	list_for_each_entry(event, &group->sibling_list, group_entry) {
+	for_each_sibling_event(event, group) {
 		if (!is_software_event(event) &&
 		    event->state != PERF_EVENT_STATE_OFF) {
 			if (n >= max_count)

@@ -60,9 +60,9 @@ struct ceph_monmap *ceph_monmap_decode(void *p, void *end)
 	num_mon = ceph_decode_32(&p);
 	ceph_decode_need(&p, end, num_mon*sizeof(m->mon_inst[0]), bad);
 
-	if (num_mon >= CEPH_MAX_MON)
+	if (num_mon > CEPH_MAX_MON)
 		goto bad;
-	m = kmalloc(sizeof(*m) + sizeof(m->mon_inst[0])*num_mon, GFP_NOFS);
+	m = kmalloc(struct_size(m, mon_inst, num_mon), GFP_NOFS);
 	if (m == NULL)
 		return ERR_PTR(-ENOMEM);
 	m->fsid = fsid;
@@ -922,6 +922,15 @@ int ceph_monc_blacklist_add(struct ceph_mon_client *monc,
 	mutex_unlock(&monc->mutex);
 
 	ret = wait_generic_request(req);
+	if (!ret)
+		/*
+		 * Make sure we have the osdmap that includes the blacklist
+		 * entry.  This is needed to ensure that the OSDs pick up the
+		 * new blacklist before processing any future requests from
+		 * this client.
+		 */
+		ret = ceph_wait_for_latest_osdmap(monc->client, 0);
+
 out:
 	put_generic_request(req);
 	return ret;
@@ -1000,8 +1009,7 @@ static int build_initial_monmap(struct ceph_mon_client *monc)
 	int i;
 
 	/* build initial monmap */
-	monc->monmap = kzalloc(sizeof(*monc->monmap) +
-			       num_mon*sizeof(monc->monmap->mon_inst[0]),
+	monc->monmap = kzalloc(struct_size(monc->monmap, mon_inst, num_mon),
 			       GFP_KERNEL);
 	if (!monc->monmap)
 		return -ENOMEM;
@@ -1250,7 +1258,7 @@ static void dispatch(struct ceph_connection *con, struct ceph_msg *msg)
 		if (monc->client->extra_mon_dispatch &&
 		    monc->client->extra_mon_dispatch(monc->client, msg) == 0)
 			break;
-			
+
 		pr_err("received unknown message type %d %s\n", type,
 		       ceph_msg_type_name(type));
 	}
@@ -1287,9 +1295,10 @@ static struct ceph_msg *mon_alloc_msg(struct ceph_connection *con,
 
 		/*
 		 * Older OSDs don't set reply tid even if the orignal
-		 * request had a non-zero tid.  Workaround this weirdness
-		 * by falling through to the allocate case.
+		 * request had a non-zero tid.  Work around this weirdness
+		 * by allocating a new message.
 		 */
+		/* fall through */
 	case CEPH_MSG_MON_MAP:
 	case CEPH_MSG_MDS_MAP:
 	case CEPH_MSG_OSD_MAP:

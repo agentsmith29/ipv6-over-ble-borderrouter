@@ -78,7 +78,7 @@ static int ft5406_thread(void *arg)
 
 	while (!kthread_should_stop()) {
 		/* 60fps polling */
-		msleep_interruptible(17);
+		usleep_range(16600, 16700);
 		memcpy_fromio(&regs, ts->ts_base, sizeof(struct ft5406_regs));
 		iowrite8(99,
 			 ts->ts_base +
@@ -218,8 +218,8 @@ static int ft5406_probe(struct platform_device *pdev)
 
 	if (!ts->ts_base) {
 		dev_warn(dev,
-		"set failed, trying get (err:%d touchbuf:%x virt:%p bus:%x)\n",
-		err, touchbuf, ts->ts_base, ts->bus_addr);
+		"set failed, trying get (err:%d touchbuf:%x virt:%p bus:%pad)\n",
+		err, touchbuf, ts->ts_base, &ts->bus_addr);
 
 		err = rpi_firmware_property(
 				fw,

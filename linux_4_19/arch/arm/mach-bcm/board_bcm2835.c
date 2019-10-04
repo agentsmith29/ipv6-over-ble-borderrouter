@@ -14,19 +14,20 @@
 
 #include <linux/init.h>
 #include <linux/irqchip.h>
+#include <linux/mm.h>
 #include <linux/of_address.h>
 #include <linux/of_fdt.h>
-#include <linux/clk/bcm2835.h>
 #include <asm/system_info.h>
 
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
+#include <asm/memory.h>
+#include <asm/pgtable.h>
 
 #include "platsmp.h"
-#include <linux/dma-mapping.h>
 
-#define BCM2835_USB_VIRT_BASE   0xf0980000
-#define BCM2835_USB_VIRT_MPHI   0xf0006000
+#define BCM2835_USB_VIRT_BASE   (VMALLOC_START)
+#define BCM2835_USB_VIRT_MPHI   (VMALLOC_START + 0x10000)
 
 static void __init bcm2835_init(void)
 {
@@ -34,18 +35,10 @@ static void __init bcm2835_init(void)
 	u32 val;
 	u64 val64;
 
-	bcm2835_init_clocks();
-
 	if (!of_property_read_u32(np, "linux,revision", &val))
 		system_rev = val;
 	if (!of_property_read_u64(np, "linux,serial", &val64))
 		system_serial_low = val64;
-}
-
-static void __init bcm2835_init_early(void)
-{
-	/* dwc_otg needs this for bounce buffers on non-aligned transfers */
-	init_dma_coherent_pool_size(SZ_1M);
 }
 
 /*
@@ -86,27 +79,33 @@ static int __init bcm2835_map_usb(unsigned long node, const char *uname,
 	map[1].pfn = __phys_to_pfn(be32_to_cpu(reg[2]) - p2b_offset);
 	map[1].length = be32_to_cpu(reg[3]);
 	map[1].type = MT_DEVICE;
-	iotable_init(map, 2);
+		iotable_init(map, 2);
 
 	return 1;
 }
 
 static void __init bcm2835_map_io(void)
 {
-	const __be32 *ranges;
+	const __be32 *ranges, *address_cells;
+	unsigned long root, addr_cells;
 	int soc, len;
 	unsigned long p2b_offset;
 
 	debug_ll_io_init();
 
+	root = of_get_flat_dt_root();
 	/* Find out how to map bus to physical address first from soc/ranges */
-	soc = of_get_flat_dt_subnode_by_name(of_get_flat_dt_root(), "soc");
+	soc = of_get_flat_dt_subnode_by_name(root, "soc");
 	if (soc < 0)
 		return;
-	ranges = of_get_flat_dt_prop(soc, "ranges", &len);
-	if (!ranges || len < (sizeof(unsigned long) * 3))
+	address_cells = of_get_flat_dt_prop(root, "#address-cells", &len);
+	if (!address_cells || len < (sizeof(unsigned long)))
 		return;
-	p2b_offset = be32_to_cpu(ranges[0]) - be32_to_cpu(ranges[1]);
+	addr_cells = be32_to_cpu(address_cells[0]);
+	ranges = of_get_flat_dt_prop(soc, "ranges", &len);
+	if (!ranges || len < (sizeof(unsigned long) * (2 + addr_cells)))
+		return;
+	p2b_offset = be32_to_cpu(ranges[0]) - be32_to_cpu(ranges[addr_cells]);
 
 	/* Now search for bcm2708-usb node in device tree */
 	of_scan_flat_dt(bcm2835_map_usb, &p2b_offset);
@@ -119,14 +118,17 @@ static const char * const bcm2835_compat[] = {
 #ifdef CONFIG_ARCH_MULTI_V7
 	"brcm,bcm2836",
 	"brcm,bcm2837",
+	"brcm,bcm2711",
 #endif
 	NULL
 };
 
 DT_MACHINE_START(BCM2835, "BCM2835")
+#if defined(CONFIG_ZONE_DMA) && defined(CONFIG_ARM_LPAE)
+	.dma_zone_size	= SZ_1G,
+#endif
 	.map_io = bcm2835_map_io,
 	.init_machine = bcm2835_init,
-	.init_early = bcm2835_init_early,
 	.dt_compat = bcm2835_compat,
 	.smp = smp_ops(bcm2836_smp_ops),
 MACHINE_END

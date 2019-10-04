@@ -43,9 +43,12 @@
 #include <linux/uaccess.h>
 #include <linux/mm.h>
 #include <linux/of.h>
+#include <asm/cputype.h>
 #include <soc/bcm2835/raspberrypi-firmware.h>
 
 #define TOTAL_SLOTS (VCHIQ_SLOT_ZERO_SLOTS + 2 * 32)
+#define VC_SAFE(x) (g_use_36bit_addrs ? ((u32)(x) | 0xc0000000) : (u32)(x))
+#define IS_VC_SAFE(x) (g_use_36bit_addrs ? !((x) & ~0x3fffffffull) : 1)
 
 #include "vchiq_arm.h"
 #include "vchiq_connected.h"
@@ -62,10 +65,10 @@
 
 #define VCHIQ_DMA_POOL_SIZE PAGE_SIZE
 
-typedef struct vchiq_2835_state_struct {
+struct vchiq_2835_state {
 	int inited;
 	VCHIQ_ARM_STATE_T arm_state;
-} VCHIQ_2835_ARM_STATE_T;
+};
 
 struct vchiq_pagelist_info {
 	PAGELIST_T *pagelist;
@@ -81,15 +84,26 @@ struct vchiq_pagelist_info {
 };
 
 static void __iomem *g_regs;
-static unsigned int g_cache_line_size = sizeof(CACHE_LINE_SIZE);
+/* This value is the size of the L2 cache lines as understood by the
+ * VPU firmware, which determines the required alignment of the
+ * offsets/sizes in pagelists.
+ *
+ * Previous VPU firmware looked for a DT "cache-line-size" property in
+ * the VCHIQ node and would overwrite it with the actual L2 cache size,
+ * which the kernel must then respect.  That property was rejected
+ * upstream, so we now rely on both sides to "do the right thing" independently
+ * of the other. To improve backwards compatibility, this new behaviour is
+ * signalled to the firmware by the use of a corrected "reg" property on the
+ * relevant Device Tree node.
+ */
+static unsigned int g_cache_line_size;
 static struct dma_pool *g_dma_pool;
+static unsigned int g_use_36bit_addrs = 0;
 static unsigned int g_fragments_size;
 static char *g_fragments_base;
 static char *g_free_fragments;
 static struct semaphore g_free_fragments_sema;
 static struct device *g_dev;
-
-extern int vchiq_arm_log_level;
 
 static DEFINE_SEMAPHORE(g_free_fragments_mutex);
 
@@ -97,8 +111,7 @@ static irqreturn_t
 vchiq_doorbell_irq(int irq, void *dev_id);
 
 static struct vchiq_pagelist_info *
-create_pagelist(char __user *buf, size_t count, unsigned short type,
-		struct task_struct *task);
+create_pagelist(char __user *buf, size_t count, unsigned short type);
 
 static void
 free_pagelist(struct vchiq_pagelist_info *pagelistinfo,
@@ -107,7 +120,8 @@ free_pagelist(struct vchiq_pagelist_info *pagelistinfo,
 int vchiq_platform_init(struct platform_device *pdev, VCHIQ_STATE_T *state)
 {
 	struct device *dev = &pdev->dev;
-	struct rpi_firmware *fw = platform_get_drvdata(pdev);
+	struct vchiq_drvdata *drvdata = platform_get_drvdata(pdev);
+	struct rpi_firmware *fw = drvdata->fw;
 	VCHIQ_SLOT_ZERO_T *vchiq_slot_zero;
 	struct resource *res;
 	void *slot_mem;
@@ -125,15 +139,10 @@ int vchiq_platform_init(struct platform_device *pdev, VCHIQ_STATE_T *state)
 	if (err < 0)
 		return err;
 
-	err = of_property_read_u32(dev->of_node, "cache-line-size",
-				   &g_cache_line_size);
-
-	if (err) {
-		dev_err(dev, "Missing cache-line-size property\n");
-		return -ENODEV;
-	}
-
+	g_cache_line_size = drvdata->cache_line_size;
 	g_fragments_size = 2 * g_cache_line_size;
+
+	g_use_36bit_addrs = (dev->dma_pfn_offset == 0);
 
 	/* Allocate space for the channels in coherent memory */
 	slot_mem_size = PAGE_ALIGN(TOTAL_SLOTS * VCHIQ_SLOT_SIZE);
@@ -146,14 +155,21 @@ int vchiq_platform_init(struct platform_device *pdev, VCHIQ_STATE_T *state)
 		return -ENOMEM;
 	}
 
+	if (!IS_VC_SAFE(slot_phys)) {
+		dev_err(dev, "allocated DMA memory %pad is not VC-safe\n",
+			&slot_phys);
+		return -ENOMEM;
+	}
+
 	WARN_ON(((unsigned long)slot_mem & (PAGE_SIZE - 1)) != 0);
+	channelbase = VC_SAFE(slot_phys);
 
 	vchiq_slot_zero = vchiq_init_slots(slot_mem, slot_mem_size);
 	if (!vchiq_slot_zero)
 		return -EINVAL;
 
 	vchiq_slot_zero->platform_data[VCHIQ_PLATFORM_FRAGMENTS_OFFSET_IDX] =
-		(int)slot_phys + slot_mem_size;
+		channelbase + slot_mem_size;
 	vchiq_slot_zero->platform_data[VCHIQ_PLATFORM_FRAGMENTS_COUNT_IDX] =
 		MAX_FRAGMENTS;
 
@@ -189,7 +205,6 @@ int vchiq_platform_init(struct platform_device *pdev, VCHIQ_STATE_T *state)
 	}
 
 	/* Send the base address of the slots to VideoCore */
-	channelbase = slot_phys;
 	err = rpi_firmware_property(fw, RPI_FIRMWARE_VCHIQ_INIT,
 				    &channelbase, sizeof(channelbase));
 	if (err || channelbase) {
@@ -219,25 +234,33 @@ VCHIQ_STATUS_T
 vchiq_platform_init_state(VCHIQ_STATE_T *state)
 {
 	VCHIQ_STATUS_T status = VCHIQ_SUCCESS;
+	struct vchiq_2835_state *platform_state;
 
-	state->platform_state = kzalloc(sizeof(VCHIQ_2835_ARM_STATE_T), GFP_KERNEL);
-	((VCHIQ_2835_ARM_STATE_T *)state->platform_state)->inited = 1;
-	status = vchiq_arm_init_state(state, &((VCHIQ_2835_ARM_STATE_T *)state->platform_state)->arm_state);
+	state->platform_state = kzalloc(sizeof(*platform_state), GFP_KERNEL);
+	if (!state->platform_state)
+		return VCHIQ_ERROR;
+
+	platform_state = (struct vchiq_2835_state *)state->platform_state;
+
+	platform_state->inited = 1;
+	status = vchiq_arm_init_state(state, &platform_state->arm_state);
+
 	if (status != VCHIQ_SUCCESS)
-	{
-		((VCHIQ_2835_ARM_STATE_T *)state->platform_state)->inited = 0;
-	}
+		platform_state->inited = 0;
+
 	return status;
 }
 
 VCHIQ_ARM_STATE_T*
 vchiq_platform_get_arm_state(VCHIQ_STATE_T *state)
 {
-	if (!((VCHIQ_2835_ARM_STATE_T *)state->platform_state)->inited)
-	{
-		BUG();
-	}
-	return &((VCHIQ_2835_ARM_STATE_T *)state->platform_state)->arm_state;
+	struct vchiq_2835_state *platform_state;
+
+	platform_state   = (struct vchiq_2835_state *)state->platform_state;
+
+	WARN_ON_ONCE(!platform_state->inited);
+
+	return &platform_state->arm_state;
 }
 
 void
@@ -264,14 +287,13 @@ vchiq_prepare_bulk_data(VCHIQ_BULK_T *bulk, VCHI_MEM_HANDLE_T memhandle,
 	pagelistinfo = create_pagelist((char __user *)offset, size,
 				       (dir == VCHIQ_BULK_RECEIVE)
 				       ? PAGELIST_READ
-				       : PAGELIST_WRITE,
-				       current);
+				       : PAGELIST_WRITE);
 
 	if (!pagelistinfo)
 		return VCHIQ_ERROR;
 
 	bulk->handle = memhandle;
-	bulk->data = (void *)(unsigned long)pagelistinfo->dma_addr;
+	bulk->data = (void *)VC_SAFE(pagelistinfo->dma_addr);
 
 	/*
 	 * Store the pagelistinfo address in remote_data,
@@ -401,16 +423,15 @@ cleanup_pagelistinfo(struct vchiq_pagelist_info *pagelistinfo)
 }
 
 /* There is a potential problem with partial cache lines (pages?)
-** at the ends of the block when reading. If the CPU accessed anything in
-** the same line (page?) then it may have pulled old data into the cache,
-** obscuring the new data underneath. We can solve this by transferring the
-** partial cache lines separately, and allowing the ARM to copy into the
-** cached area.
-*/
+ * at the ends of the block when reading. If the CPU accessed anything in
+ * the same line (page?) then it may have pulled old data into the cache,
+ * obscuring the new data underneath. We can solve this by transferring the
+ * partial cache lines separately, and allowing the ARM to copy into the
+ * cached area.
+ */
 
 static struct vchiq_pagelist_info *
-create_pagelist(char __user *buf, size_t count, unsigned short type,
-		struct task_struct *task)
+create_pagelist(char __user *buf, size_t count, unsigned short type)
 {
 	PAGELIST_T *pagelist;
 	struct vchiq_pagelist_info *pagelistinfo;
@@ -424,8 +445,17 @@ create_pagelist(char __user *buf, size_t count, unsigned short type,
 	int dma_buffers;
 	dma_addr_t dma_addr;
 
+	if (count >= INT_MAX - PAGE_SIZE)
+		return NULL;
+
 	offset = ((unsigned int)(unsigned long)buf & (PAGE_SIZE - 1));
 	num_pages = DIV_ROUND_UP(count + offset, PAGE_SIZE);
+
+	if (num_pages > (SIZE_MAX - sizeof(PAGELIST_T) -
+			 sizeof(struct vchiq_pagelist_info)) /
+			(sizeof(u32) + sizeof(pages[0]) +
+			 sizeof(struct scatterlist)))
+		return NULL;
 
 	pagelist_size = sizeof(PAGELIST_T) +
 			(num_pages * sizeof(u32)) +
@@ -434,8 +464,8 @@ create_pagelist(char __user *buf, size_t count, unsigned short type,
 			sizeof(struct vchiq_pagelist_info);
 
 	/* Allocate enough storage to hold the page pointers and the page
-	** list
-	*/
+	 * list
+	 */
 	if (pagelist_size > VCHIQ_DMA_POOL_SIZE) {
 		pagelist = dma_zalloc_coherent(g_dev,
 					       pagelist_size,
@@ -447,8 +477,8 @@ create_pagelist(char __user *buf, size_t count, unsigned short type,
 		is_from_pool = true;
 	}
 
-	vchiq_log_trace(vchiq_arm_log_level, "create_pagelist - %pK",
-			pagelist);
+	vchiq_log_trace(vchiq_arm_log_level, "%s - %pK", __func__, pagelist);
+
 	if (!pagelist)
 		return NULL;
 
@@ -498,24 +528,19 @@ create_pagelist(char __user *buf, size_t count, unsigned short type,
 		}
 		/* do not try and release vmalloc pages */
 	} else {
-		down_read(&task->mm->mmap_sem);
-		actual_pages = get_user_pages(
+		actual_pages = get_user_pages_fast(
 					  (unsigned long)buf & PAGE_MASK,
 					  num_pages,
-					  (type == PAGELIST_READ) ? FOLL_WRITE : 0,
-					  pages,
-					  NULL /*vmas */);
-		up_read(&task->mm->mmap_sem);
+					  type == PAGELIST_READ,
+					  pages);
 
 		if (actual_pages != num_pages) {
 			vchiq_log_info(vchiq_arm_log_level,
-				       "create_pagelist - only %d/%d pages locked",
-				       actual_pages,
-				       num_pages);
+				       "%s - only %d/%d pages locked",
+				       __func__, actual_pages, num_pages);
 
 			/* This is probably due to the process being killed */
-			while (actual_pages > 0)
-			{
+			while (actual_pages > 0) {
 				actual_pages--;
 				put_page(pages[actual_pages]);
 			}
@@ -556,25 +581,60 @@ create_pagelist(char __user *buf, size_t count, unsigned short type,
 
 	/* Combine adjacent blocks for performance */
 	k = 0;
-	for_each_sg(scatterlist, sg, dma_buffers, i) {
-		u32 len = sg_dma_len(sg);
-		u32 addr = sg_dma_address(sg);
+	if (g_use_36bit_addrs) {
+		for_each_sg(scatterlist, sg, dma_buffers, i) {
+			u32 len = sg_dma_len(sg);
+			u64 addr = sg_dma_address(sg);
+			u32 page_id = (u32)((addr >> 4) & ~0xff);
+			u32 sg_pages = (len + PAGE_SIZE - 1) >> PAGE_SHIFT;
 
-		/* Note: addrs is the address + page_count - 1
-		 * The firmware expects blocks after the first to be page-
-		 * aligned and a multiple of the page size
-		 */
-		WARN_ON(len == 0);
-		WARN_ON(i && (i != (dma_buffers - 1)) && (len & ~PAGE_MASK));
-		WARN_ON(i && (addr & ~PAGE_MASK));
-		if (k > 0 &&
-		    ((addrs[k - 1] & PAGE_MASK) +
-		     (((addrs[k - 1] & ~PAGE_MASK) + 1) << PAGE_SHIFT))
-		    == (addr & PAGE_MASK))
-			addrs[k - 1] += ((len + PAGE_SIZE - 1) >> PAGE_SHIFT);
-		else
-			addrs[k++] = (addr & PAGE_MASK) |
-				(((len + PAGE_SIZE - 1) >> PAGE_SHIFT) - 1);
+			/* Note: addrs is the address + page_count - 1
+			 * The firmware expects blocks after the first to be page-
+			 * aligned and a multiple of the page size
+			 */
+			WARN_ON(len == 0);
+			WARN_ON(i &&
+				(i != (dma_buffers - 1)) && (len & ~PAGE_MASK));
+			WARN_ON(i && (addr & ~PAGE_MASK));
+			WARN_ON(upper_32_bits(addr) > 0xf);
+			if (k > 0 &&
+			    ((addrs[k - 1] & ~0xff) +
+			     (((addrs[k - 1] & 0xff) + 1) << 8)
+			     == page_id)) {
+				u32 inc_pages = min(sg_pages,
+						    0xff - (addrs[k - 1] & 0xff));
+				addrs[k - 1] += inc_pages;
+				page_id += inc_pages << 8;
+				sg_pages -= inc_pages;
+			}
+			while (sg_pages) {
+				u32 inc_pages = min(sg_pages, 0x100u);
+				addrs[k++] = page_id | (inc_pages - 1);
+				page_id += inc_pages << 8;
+				sg_pages -= inc_pages;
+			}
+		}
+	} else {
+		for_each_sg(scatterlist, sg, dma_buffers, i) {
+			u32 len = sg_dma_len(sg);
+			u32 addr = VC_SAFE(sg_dma_address(sg));
+			u32 new_pages = (len + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
+			/* Note: addrs is the address + page_count - 1
+			 * The firmware expects blocks after the first to be page-
+			 * aligned and a multiple of the page size
+			 */
+			WARN_ON(len == 0);
+			WARN_ON(i && (i != (dma_buffers - 1)) && (len & ~PAGE_MASK));
+			WARN_ON(i && (addr & ~PAGE_MASK));
+			if (k > 0 &&
+			    ((addrs[k - 1] & PAGE_MASK) +
+			     (((addrs[k - 1] & ~PAGE_MASK) + 1) << PAGE_SHIFT))
+			    == (addr & PAGE_MASK))
+				addrs[k - 1] += new_pages;
+			else
+				addrs[k++] = (addr & PAGE_MASK) | (new_pages - 1);
+		}
 	}
 
 	/* Partial cache lines (fragments) require special measures */
@@ -611,8 +671,8 @@ free_pagelist(struct vchiq_pagelist_info *pagelistinfo,
 	struct page **pages    = pagelistinfo->pages;
 	unsigned int num_pages = pagelistinfo->num_pages;
 
-	vchiq_log_trace(vchiq_arm_log_level, "free_pagelist - %pK, %d",
-			pagelistinfo->pagelist, actual);
+	vchiq_log_trace(vchiq_arm_log_level, "%s - %pK, %d",
+			__func__, pagelistinfo->pagelist, actual);
 
 	/*
 	 * NOTE: dma_unmap_sg must be called before the

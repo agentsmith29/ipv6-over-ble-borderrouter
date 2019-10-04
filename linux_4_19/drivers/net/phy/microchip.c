@@ -22,6 +22,7 @@
 #include <linux/microchipphy.h>
 #include <linux/delay.h>
 #include <linux/of.h>
+#include <dt-bindings/net/microchip-lan78xx.h>
 
 #define DRIVER_AUTHOR	"WOOJUNG HUH <woojung.huh@microchip.com>"
 #define DRIVER_DESC	"Microchip LAN88XX PHY driver"
@@ -226,13 +227,36 @@ static int lan88xx_probe(struct phy_device *phydev)
 {
 	struct device *dev = &phydev->mdio.dev;
 	struct lan88xx_priv *priv;
+	u32 led_modes[4];
 	u32 downshift_after = 0;
+	int len;
 
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
 
 	priv->wolopts = 0;
+
+	len = of_property_read_variable_u32_array(dev->of_node,
+						  "microchip,led-modes",
+						  led_modes,
+						  0,
+						  ARRAY_SIZE(led_modes));
+	if (len >= 0) {
+		u32 reg = 0;
+		int i;
+
+		for (i = 0; i < len; i++) {
+			if (led_modes[i] > 15)
+				return -EINVAL;
+			reg |= led_modes[i] << (i * 4);
+		}
+		for (; i < ARRAY_SIZE(led_modes); i++)
+			reg |= LAN78XX_FORCE_LED_OFF << (i * 4);
+		(void)phy_write(phydev, LAN78XX_PHY_LED_MODE_SELECT, reg);
+	} else if (len == -EOVERFLOW) {
+		return -EINVAL;
+	}
 
 	if (!of_property_read_u32(dev->of_node,
 				  "microchip,downshift-after",
@@ -360,7 +384,6 @@ static struct phy_driver microchip_phy_driver[] = {
 
 	.config_init	= lan88xx_config_init,
 	.config_aneg	= lan88xx_config_aneg,
-	.read_status	= genphy_read_status,
 
 	.ack_interrupt	= lan88xx_phy_ack_interrupt,
 	.config_intr	= lan88xx_phy_config_intr,

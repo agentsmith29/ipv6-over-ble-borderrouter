@@ -498,7 +498,11 @@ nocache:
 	}
 
 found:
-	if (addr + size > vend)
+	/*
+	 * Check also calculated address against the vstart,
+	 * because it can be 0 because of big align request.
+	 */
+	if (addr + size > vend || addr < vstart)
 		goto overflow;
 
 	va->va_start = addr;
@@ -601,26 +605,6 @@ static void free_vmap_area(struct vmap_area *va)
 static void unmap_vmap_area(struct vmap_area *va)
 {
 	vunmap_page_range(va->va_start, va->va_end);
-}
-
-static void vmap_debug_free_range(unsigned long start, unsigned long end)
-{
-	/*
-	 * Unmap page tables and force a TLB flush immediately if pagealloc
-	 * debugging is enabled.  This catches use after free bugs similarly to
-	 * those in linear kernel virtual address space after a page has been
-	 * freed.
-	 *
-	 * All the lazy freeing logic is still retained, in order to minimise
-	 * intrusiveness of this debugging feature.
-	 *
-	 * This is going to be *slow* (linear kernel virtual address debugging
-	 * doesn't do a broadcast TLB flush so it is a lot faster).
-	 */
-	if (debug_pagealloc_enabled()) {
-		vunmap_page_range(start, end);
-		flush_tlb_kernel_range(start, end);
-	}
 }
 
 /*
@@ -756,6 +740,9 @@ static void free_unmap_vmap_area(struct vmap_area *va)
 {
 	flush_cache_vunmap(va->va_start, va->va_end);
 	unmap_vmap_area(va);
+	if (debug_pagealloc_enabled())
+		flush_tlb_kernel_range(va->va_start, va->va_end);
+
 	free_vmap_area_noflush(va);
 }
 
@@ -1053,6 +1040,10 @@ static void vb_free(const void *addr, unsigned long size)
 
 	vunmap_page_range((unsigned long)addr, (unsigned long)addr + size);
 
+	if (debug_pagealloc_enabled())
+		flush_tlb_kernel_range((unsigned long)addr,
+					(unsigned long)addr + size);
+
 	spin_lock(&vb->lock);
 
 	/* Expand dirty range */
@@ -1141,16 +1132,16 @@ void vm_unmap_ram(const void *mem, unsigned int count)
 	BUG_ON(addr > VMALLOC_END);
 	BUG_ON(!PAGE_ALIGNED(addr));
 
-	debug_check_no_locks_freed(mem, size);
-	vmap_debug_free_range(addr, addr+size);
-
 	if (likely(count <= VMAP_MAX_ALLOC)) {
+		debug_check_no_locks_freed(mem, size);
 		vb_free(mem, size);
 		return;
 	}
 
 	va = find_vmap_area(addr);
 	BUG_ON(!va);
+	debug_check_no_locks_freed((void *)va->va_start,
+				    (va->va_end - va->va_start));
 	free_unmap_vmap_area(va);
 }
 EXPORT_SYMBOL(vm_unmap_ram);
@@ -1499,7 +1490,6 @@ struct vm_struct *remove_vm_area(const void *addr)
 		va->flags |= VM_LAZY_FREE;
 		spin_unlock(&vmap_area_lock);
 
-		vmap_debug_free_range(va->va_start, va->va_end);
 		kasan_free_shadow(vm);
 		free_unmap_vmap_area(va);
 
@@ -1526,8 +1516,8 @@ static void __vunmap(const void *addr, int deallocate_pages)
 		return;
 	}
 
-	debug_check_no_locks_freed(addr, get_vm_area_size(area));
-	debug_check_no_obj_freed(addr, get_vm_area_size(area));
+	debug_check_no_locks_freed(area->addr, get_vm_area_size(area));
+	debug_check_no_obj_freed(area->addr, get_vm_area_size(area));
 
 	remove_vm_area(addr);
 	if (deallocate_pages) {
@@ -1762,6 +1752,12 @@ void *__vmalloc_node_range(unsigned long size, unsigned long align,
 		return NULL;
 
 	/*
+	 * First make sure the mappings are removed from all page-tables
+	 * before they are freed.
+	 */
+	vmalloc_sync_all();
+
+	/*
 	 * In this function, newly allocated vm_struct has VM_UNINITIALIZED
 	 * flag. It means that vm_struct is not fully initialized.
 	 * Now, it is fully initialized, so remove this flag here.
@@ -1920,10 +1916,6 @@ void *vzalloc_node(unsigned long size, int node)
 			 GFP_KERNEL | __GFP_ZERO);
 }
 EXPORT_SYMBOL(vzalloc_node);
-
-#ifndef PAGE_KERNEL_EXEC
-# define PAGE_KERNEL_EXEC PAGE_KERNEL
-#endif
 
 /**
  *	vmalloc_exec  -  allocate virtually contiguous, executable memory
@@ -2262,7 +2254,7 @@ int remap_vmalloc_range_partial(struct vm_area_struct *vma, unsigned long uaddr,
 	if (!(area->flags & VM_USERMAP))
 		return -EINVAL;
 
-	if (kaddr + size > area->addr + area->size)
+	if (kaddr + size > area->addr + get_vm_area_size(area))
 		return -EINVAL;
 
 	do {
@@ -2310,6 +2302,9 @@ EXPORT_SYMBOL(remap_vmalloc_range);
 /*
  * Implement a stub for vmalloc_sync_all() if the architecture chose not to
  * have one.
+ *
+ * The purpose of this function is to make sure the vmalloc area
+ * mappings are identical in all page-tables in the system.
  */
 void __weak vmalloc_sync_all(void)
 {
@@ -2752,25 +2747,14 @@ static const struct seq_operations vmalloc_op = {
 	.show = s_show,
 };
 
-static int vmalloc_open(struct inode *inode, struct file *file)
-{
-	if (IS_ENABLED(CONFIG_NUMA))
-		return seq_open_private(file, &vmalloc_op,
-					nr_node_ids * sizeof(unsigned int));
-	else
-		return seq_open(file, &vmalloc_op);
-}
-
-static const struct file_operations proc_vmalloc_operations = {
-	.open		= vmalloc_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= seq_release_private,
-};
-
 static int __init proc_vmalloc_init(void)
 {
-	proc_create("vmallocinfo", S_IRUSR, NULL, &proc_vmalloc_operations);
+	if (IS_ENABLED(CONFIG_NUMA))
+		proc_create_seq_private("vmallocinfo", 0400, NULL,
+				&vmalloc_op,
+				nr_node_ids * sizeof(unsigned int), NULL);
+	else
+		proc_create_seq("vmallocinfo", 0400, NULL, &vmalloc_op);
 	return 0;
 }
 module_init(proc_vmalloc_init);

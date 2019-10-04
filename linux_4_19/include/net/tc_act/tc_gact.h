@@ -34,6 +34,11 @@ static inline bool __is_tcf_gact_act(const struct tc_action *a, int act,
 	return false;
 }
 
+static inline bool is_tcf_gact_ok(const struct tc_action *a)
+{
+	return __is_tcf_gact_act(a, TC_ACT_OK, false);
+}
+
 static inline bool is_tcf_gact_shot(const struct tc_action *a)
 {
 	return __is_tcf_gact_act(a, TC_ACT_SHOT, false);
@@ -51,7 +56,7 @@ static inline bool is_tcf_gact_goto_chain(const struct tc_action *a)
 
 static inline u32 tcf_gact_goto_chain_index(const struct tc_action *a)
 {
-	return a->goto_chain->index;
+	return READ_ONCE(a->tcfa_action) & TC_ACT_EXT_VAL_MASK;
 }
 
 #endif /* __NET_TC_GACT_H */

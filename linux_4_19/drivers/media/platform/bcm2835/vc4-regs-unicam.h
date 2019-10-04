@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+
 /*
  * Copyright (C) 2017 Raspberry Pi Trading.
  * Dave Stevenson <dave.stevenson@raspberrypi.org>

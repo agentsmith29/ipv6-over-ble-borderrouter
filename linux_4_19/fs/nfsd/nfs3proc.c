@@ -192,6 +192,7 @@ nfsd3_proc_write(struct svc_rqst *rqstp)
 	struct nfsd3_writeres *resp = rqstp->rq_resp;
 	__be32	nfserr;
 	unsigned long cnt = argp->len;
+	unsigned int nvecs;
 
 	dprintk("nfsd: WRITE(3)    %s %d bytes at %Lu%s\n",
 				SVCFH_fmt(&argp->fh),
@@ -201,9 +202,13 @@ nfsd3_proc_write(struct svc_rqst *rqstp)
 
 	fh_copy(&resp->fh, &argp->fh);
 	resp->committed = argp->stable;
+	nvecs = svc_fill_write_vector(rqstp, rqstp->rq_arg.pages,
+				      &argp->first, cnt);
+	if (!nvecs)
+		RETURN_STATUS(nfserr_io);
 	nfserr = nfsd_write(rqstp, &resp->fh, argp->offset,
-				rqstp->rq_vec, argp->vlen,
-				&cnt, resp->committed);
+			    rqstp->rq_vec, nvecs, &cnt,
+			    resp->committed);
 	resp->count = cnt;
 	RETURN_STATUS(nfserr);
 }
@@ -279,6 +284,17 @@ nfsd3_proc_symlink(struct svc_rqst *rqstp)
 	struct nfsd3_diropres *resp = rqstp->rq_resp;
 	__be32	nfserr;
 
+	if (argp->tlen == 0)
+		RETURN_STATUS(nfserr_inval);
+	if (argp->tlen > NFS3_MAXPATHLEN)
+		RETURN_STATUS(nfserr_nametoolong);
+
+	argp->tname = svc_fill_symlink_pathname(rqstp, &argp->first,
+						page_address(rqstp->rq_arg.pages[0]),
+						argp->tlen);
+	if (IS_ERR(argp->tname))
+		RETURN_STATUS(nfserrno(PTR_ERR(argp->tname)));
+
 	dprintk("nfsd: SYMLINK(3)  %s %.*s -> %.*s\n",
 				SVCFH_fmt(&argp->ffh),
 				argp->flen, argp->fname,
@@ -288,6 +304,7 @@ nfsd3_proc_symlink(struct svc_rqst *rqstp)
 	fh_init(&resp->fh, NFS3_FHSIZE);
 	nfserr = nfsd_symlink(rqstp, &resp->dirfh, argp->fname, argp->flen,
 						   argp->tname, &resp->fh);
+	kfree(argp->tname);
 	RETURN_STATUS(nfserr);
 }
 
@@ -446,8 +463,19 @@ nfsd3_proc_readdir(struct svc_rqst *rqstp)
 					&resp->common, nfs3svc_encode_entry);
 	memcpy(resp->verf, argp->verf, 8);
 	resp->count = resp->buffer - argp->buffer;
-	if (resp->offset)
-		xdr_encode_hyper(resp->offset, argp->cookie);
+	if (resp->offset) {
+		loff_t offset = argp->cookie;
+
+		if (unlikely(resp->offset1)) {
+			/* we ended up with offset on a page boundary */
+			*resp->offset = htonl(offset >> 32);
+			*resp->offset1 = htonl(offset & 0xffffffff);
+			resp->offset1 = NULL;
+		} else {
+			xdr_encode_hyper(resp->offset, offset);
+		}
+		resp->offset = NULL;
+	}
 
 	RETURN_STATUS(nfserr);
 }
@@ -516,6 +544,7 @@ nfsd3_proc_readdirplus(struct svc_rqst *rqstp)
 		} else {
 			xdr_encode_hyper(resp->offset, offset);
 		}
+		resp->offset = NULL;
 	}
 
 	RETURN_STATUS(nfserr);

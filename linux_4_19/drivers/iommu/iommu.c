@@ -36,7 +36,11 @@
 
 static struct kset *iommu_group_kset;
 static DEFINE_IDA(iommu_group_ida);
+#ifdef CONFIG_IOMMU_DEFAULT_PASSTHROUGH
+static unsigned int iommu_def_domain_type = IOMMU_DOMAIN_IDENTITY;
+#else
 static unsigned int iommu_def_domain_type = IOMMU_DOMAIN_DMA;
+#endif
 
 struct iommu_callback_data {
 	const struct iommu_ops *ops;
@@ -116,9 +120,11 @@ static void __iommu_detach_group(struct iommu_domain *domain,
 static int __init iommu_set_def_domain_type(char *str)
 {
 	bool pt;
+	int ret;
 
-	if (!str || strtobool(str, &pt))
-		return -EINVAL;
+	ret = kstrtobool(str, &pt);
+	if (ret)
+		return ret;
 
 	iommu_def_domain_type = pt ? IOMMU_DOMAIN_IDENTITY : IOMMU_DOMAIN_DMA;
 	return 0;
@@ -205,18 +211,21 @@ static int iommu_insert_resv_region(struct iommu_resv_region *new,
 			pos = pos->next;
 		} else if ((start >= a) && (end <= b)) {
 			if (new->type == type)
-				goto done;
+				return 0;
 			else
 				pos = pos->next;
 		} else {
 			if (new->type == type) {
 				phys_addr_t new_start = min(a, start);
 				phys_addr_t new_end = max(b, end);
+				int ret;
 
 				list_del(&entry->list);
 				entry->start = new_start;
 				entry->length = new_end - new_start + 1;
-				iommu_insert_resv_region(entry, regions);
+				ret = iommu_insert_resv_region(entry, regions);
+				kfree(entry);
+				return ret;
 			} else {
 				pos = pos->next;
 			}
@@ -229,7 +238,6 @@ insert:
 		return -ENOMEM;
 
 	list_add_tail(&region->list, pos);
-done:
 	return 0;
 }
 
@@ -292,10 +300,38 @@ static ssize_t iommu_group_show_resv_regions(struct iommu_group *group,
 	return (str - buf);
 }
 
+static ssize_t iommu_group_show_type(struct iommu_group *group,
+				     char *buf)
+{
+	char *type = "unknown\n";
+
+	if (group->default_domain) {
+		switch (group->default_domain->type) {
+		case IOMMU_DOMAIN_BLOCKED:
+			type = "blocked\n";
+			break;
+		case IOMMU_DOMAIN_IDENTITY:
+			type = "identity\n";
+			break;
+		case IOMMU_DOMAIN_UNMANAGED:
+			type = "unmanaged\n";
+			break;
+		case IOMMU_DOMAIN_DMA:
+			type = "DMA";
+			break;
+		}
+	}
+	strcpy(buf, type);
+
+	return strlen(type);
+}
+
 static IOMMU_GROUP_ATTR(name, S_IRUGO, iommu_group_show_name, NULL);
 
 static IOMMU_GROUP_ATTR(reserved_regions, 0444,
 			iommu_group_show_resv_regions, NULL);
+
+static IOMMU_GROUP_ATTR(type, 0444, iommu_group_show_type, NULL);
 
 static void iommu_group_release(struct kobject *kobj)
 {
@@ -322,7 +358,6 @@ static struct kobj_type iommu_group_ktype = {
 
 /**
  * iommu_group_alloc - Allocate a new group
- * @name: Optional name to associate with group, visible in sysfs
  *
  * This function is called by an iommu driver to allocate a new iommu
  * group.  The iommu group represents the minimum granularity of the iommu.
@@ -376,6 +411,10 @@ struct iommu_group *iommu_group_alloc(void)
 
 	ret = iommu_group_create_file(group,
 				      &iommu_group_attr_reserved_regions);
+	if (ret)
+		return ERR_PTR(ret);
+
+	ret = iommu_group_create_file(group, &iommu_group_attr_type);
 	if (ret)
 		return ERR_PTR(ret);
 
@@ -1303,6 +1342,9 @@ int iommu_attach_device(struct iommu_domain *domain, struct device *dev)
 	int ret;
 
 	group = iommu_group_get(dev);
+	if (!group)
+		return -ENODEV;
+
 	/*
 	 * Lock the group to make sure the device-count doesn't
 	 * change while we are attaching
@@ -1341,6 +1383,8 @@ void iommu_detach_device(struct iommu_domain *domain, struct device *dev)
 	struct iommu_group *group;
 
 	group = iommu_group_get(dev);
+	if (!group)
+		return;
 
 	mutex_lock(&group->mutex);
 	if (iommu_group_device_count(group) != 1) {
@@ -1568,10 +1612,10 @@ static size_t __iommu_unmap(struct iommu_domain *domain,
 
 	if (unlikely(ops->unmap == NULL ||
 		     domain->pgsize_bitmap == 0UL))
-		return -ENODEV;
+		return 0;
 
 	if (unlikely(!(domain->type & __IOMMU_DOMAIN_PAGING)))
-		return -EINVAL;
+		return 0;
 
 	/* find out the minimum page size supported */
 	min_pagesz = 1 << __ffs(domain->pgsize_bitmap);
@@ -1584,7 +1628,7 @@ static size_t __iommu_unmap(struct iommu_domain *domain,
 	if (!IS_ALIGNED(iova | size, min_pagesz)) {
 		pr_err("unaligned: iova 0x%lx size 0x%zx min_pagesz 0x%x\n",
 		       iova, size, min_pagesz);
-		return -EINVAL;
+		return 0;
 	}
 
 	pr_debug("unmap this: iova 0x%lx size 0x%zx\n", iova, size);
@@ -1631,8 +1675,8 @@ size_t iommu_unmap_fast(struct iommu_domain *domain,
 }
 EXPORT_SYMBOL_GPL(iommu_unmap_fast);
 
-size_t default_iommu_map_sg(struct iommu_domain *domain, unsigned long iova,
-			 struct scatterlist *sg, unsigned int nents, int prot)
+size_t iommu_map_sg(struct iommu_domain *domain, unsigned long iova,
+		    struct scatterlist *sg, unsigned int nents, int prot)
 {
 	struct scatterlist *s;
 	size_t mapped = 0;
@@ -1672,7 +1716,7 @@ out_err:
 	return 0;
 
 }
-EXPORT_SYMBOL_GPL(default_iommu_map_sg);
+EXPORT_SYMBOL_GPL(iommu_map_sg);
 
 int iommu_domain_window_enable(struct iommu_domain *domain, u32 wnd_nr,
 			       phys_addr_t paddr, u64 size, int prot)
@@ -1741,6 +1785,8 @@ static int __init iommu_init(void)
 	iommu_group_kset = kset_create_and_add("iommu_groups",
 					       NULL, kernel_kobj);
 	BUG_ON(!iommu_group_kset);
+
+	iommu_debugfs_setup();
 
 	return 0;
 }

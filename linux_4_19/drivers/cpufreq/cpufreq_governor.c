@@ -276,7 +276,7 @@ static void dbs_update_util_handler(struct update_util_data *data, u64 time,
 	struct policy_dbs_info *policy_dbs = cdbs->policy_dbs;
 	u64 delta_ns, lst;
 
-	if (!cpufreq_can_do_remote_dvfs(policy_dbs->policy))
+	if (!cpufreq_this_cpu_can_update(policy_dbs->policy))
 		return;
 
 	/*
@@ -458,6 +458,8 @@ int cpufreq_dbs_governor_init(struct cpufreq_policy *policy)
 
 	/* Failure, so roll back. */
 	pr_err("initialization failed (dbs_data kobject init error %d)\n", ret);
+
+	kobject_put(&dbs_data->attr_set.kobj);
 
 	policy->governor_data = NULL;
 

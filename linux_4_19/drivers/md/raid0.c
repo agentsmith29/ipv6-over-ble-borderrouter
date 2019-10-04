@@ -159,12 +159,14 @@ static int create_strip_zones(struct mddev *mddev, struct r0conf **private_conf)
 	}
 
 	err = -ENOMEM;
-	conf->strip_zone = kzalloc(sizeof(struct strip_zone)*
-				conf->nr_strip_zones, GFP_KERNEL);
+	conf->strip_zone = kcalloc(conf->nr_strip_zones,
+				   sizeof(struct strip_zone),
+				   GFP_KERNEL);
 	if (!conf->strip_zone)
 		goto abort;
-	conf->devlist = kzalloc(sizeof(struct md_rdev*)*
-				conf->nr_strip_zones*mddev->raid_disks,
+	conf->devlist = kzalloc(array3_size(sizeof(struct md_rdev *),
+					    conf->nr_strip_zones,
+					    mddev->raid_disks),
 				GFP_KERNEL);
 	if (!conf->devlist)
 		goto abort;
@@ -399,9 +401,9 @@ static int raid0_run(struct mddev *mddev)
 				discard_supported = true;
 		}
 		if (!discard_supported)
-			queue_flag_clear_unlocked(QUEUE_FLAG_DISCARD, mddev->queue);
+			blk_queue_flag_clear(QUEUE_FLAG_DISCARD, mddev->queue);
 		else
-			queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, mddev->queue);
+			blk_queue_flag_set(QUEUE_FLAG_DISCARD, mddev->queue);
 	}
 
 	/* calculate array device size */
@@ -479,7 +481,7 @@ static void raid0_handle_discard(struct mddev *mddev, struct bio *bio)
 	if (bio_end_sector(bio) > zone->zone_end) {
 		struct bio *split = bio_split(bio,
 			zone->zone_end - bio->bi_iter.bi_sector, GFP_NOIO,
-			mddev->bio_set);
+			&mddev->bio_set);
 		bio_chain(split, bio);
 		generic_make_request(bio);
 		bio = split;
@@ -545,6 +547,7 @@ static void raid0_handle_discard(struct mddev *mddev, struct bio *bio)
 			trace_block_bio_remap(bdev_get_queue(rdev->bdev),
 				discard_bio, disk_devt(mddev->gendisk),
 				bio->bi_iter.bi_sector);
+		bio_clear_flag(bio, BIO_QUEUE_ENTERED);
 		generic_make_request(discard_bio);
 	}
 	bio_endio(bio);
@@ -582,7 +585,8 @@ static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
 	sector = bio_sector;
 
 	if (sectors < bio_sectors(bio)) {
-		struct bio *split = bio_split(bio, sectors, GFP_NOIO, mddev->bio_set);
+		struct bio *split = bio_split(bio, sectors, GFP_NOIO,
+					      &mddev->bio_set);
 		bio_chain(split, bio);
 		generic_make_request(bio);
 		bio = split;
@@ -599,6 +603,7 @@ static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
 				disk_devt(mddev->gendisk), bio_sector);
 	mddev_check_writesame(mddev, bio);
 	mddev_check_write_zeroes(mddev, bio);
+	bio_clear_flag(bio, BIO_QUEUE_ENTERED);
 	generic_make_request(bio);
 	return true;
 }

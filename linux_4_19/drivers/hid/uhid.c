@@ -497,6 +497,7 @@ static int uhid_dev_create2(struct uhid_device *uhid,
 		goto err_free;
 	}
 
+	/* @hid is zero-initialized, strncpy() is correct, strlcpy() not */
 	len = min(sizeof(hid->name), sizeof(ev->u.create2.name)) - 1;
 	strncpy(hid->name, ev->u.create2.name, len);
 	len = min(sizeof(hid->phys), sizeof(ev->u.create2.phys)) - 1;
@@ -765,14 +766,14 @@ unlock:
 	return ret ? ret : count;
 }
 
-static unsigned int uhid_char_poll(struct file *file, poll_table *wait)
+static __poll_t uhid_char_poll(struct file *file, poll_table *wait)
 {
 	struct uhid_device *uhid = file->private_data;
 
 	poll_wait(file, &uhid->waitq, wait);
 
 	if (uhid->head != uhid->tail)
-		return POLLIN | POLLRDNORM;
+		return EPOLLIN | EPOLLRDNORM;
 
 	return 0;
 }

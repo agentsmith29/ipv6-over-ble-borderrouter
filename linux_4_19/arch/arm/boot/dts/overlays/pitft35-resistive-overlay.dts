@@ -7,7 +7,7 @@
 /plugin/;
 
 / {
-	compatible = "brcm,bcm2835", "brcm,bcm2708", "brcm,bcm2709";
+	compatible = "brcm,bcm2835";
 
 	fragment@0 {
 		target = <&spi0>;
@@ -64,8 +64,6 @@
 			};
 
 			pitft_ts@1 {
-				#address-cells = <1>;
-				#size-cells = <0>;
 				compatible = "st,stmpe610";
 				reg = <1>;
 

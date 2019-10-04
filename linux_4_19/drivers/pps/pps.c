@@ -49,13 +49,13 @@ static DEFINE_IDR(pps_idr);
  * Char device methods
  */
 
-static unsigned int pps_cdev_poll(struct file *file, poll_table *wait)
+static __poll_t pps_cdev_poll(struct file *file, poll_table *wait)
 {
 	struct pps_device *pps = file->private_data;
 
 	poll_wait(file, &pps->queue, wait);
 
-	return POLLIN | POLLRDNORM;
+	return EPOLLIN | EPOLLRDNORM;
 }
 
 static int pps_cdev_fasync(int fd, struct file *file, int on)
@@ -165,6 +165,14 @@ static long pps_cdev_ioctl(struct file *file,
 		if (pps->info.mode & PPS_CANWAIT)
 			pps->params.mode |= PPS_CANWAIT;
 		pps->params.api_version = PPS_API_VERS;
+
+		/*
+		 * Clear unused fields of pps_kparams to avoid leaking
+		 * uninitialized data of the PPS_SETPARAMS caller via
+		 * PPS_GETPARAMS
+		 */
+		pps->params.assert_off_tu.flags = 0;
+		pps->params.clear_off_tu.flags = 0;
 
 		spin_unlock_irq(&pps->lock);
 

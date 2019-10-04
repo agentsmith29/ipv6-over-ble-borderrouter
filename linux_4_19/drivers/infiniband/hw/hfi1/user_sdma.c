@@ -132,25 +132,22 @@ static int defer_packet_queue(
 	struct hfi1_user_sdma_pkt_q *pq =
 		container_of(wait, struct hfi1_user_sdma_pkt_q, busy);
 	struct hfi1_ibdev *dev = &pq->dd->verbs_dev;
-	struct user_sdma_txreq *tx =
-		container_of(txreq, struct user_sdma_txreq, txreq);
 
-	if (sdma_progress(sde, seq, txreq)) {
-		if (tx->busycount++ < MAX_DEFER_RETRY_COUNT)
-			goto eagain;
-	}
+	write_seqlock(&dev->iowait_lock);
+	if (sdma_progress(sde, seq, txreq))
+		goto eagain;
 	/*
 	 * We are assuming that if the list is enqueued somewhere, it
 	 * is to the dmawait list since that is the only place where
 	 * it is supposed to be enqueued.
 	 */
 	xchg(&pq->state, SDMA_PKT_Q_DEFERRED);
-	write_seqlock(&dev->iowait_lock);
 	if (list_empty(&pq->busy.list))
 		iowait_queue(pkts_sent, &pq->busy, &sde->dmawait);
 	write_sequnlock(&dev->iowait_lock);
 	return -EBUSY;
 eagain:
+	write_sequnlock(&dev->iowait_lock);
 	return -EAGAIN;
 }
 
@@ -803,7 +800,6 @@ static int user_sdma_send_pkts(struct user_sdma_request *req, unsigned maxpkts)
 
 		tx->flags = 0;
 		tx->req = req;
-		tx->busycount = 0;
 		INIT_LIST_HEAD(&tx->list);
 
 		/*
@@ -821,7 +817,7 @@ static int user_sdma_send_pkts(struct user_sdma_request *req, unsigned maxpkts)
 		 */
 		if (req->data_len) {
 			iovec = &req->iovs[req->iov_idx];
-			if (ACCESS_ONCE(iovec->offset) == iovec->iov.iov_len) {
+			if (READ_ONCE(iovec->offset) == iovec->iov.iov_len) {
 				if (++req->iov_idx == req->data_iovs) {
 					ret = -EFAULT;
 					goto free_tx;
@@ -951,10 +947,8 @@ static int pin_sdma_pages(struct user_sdma_request *req,
 	struct hfi1_user_sdma_pkt_q *pq = req->pq;
 
 	pages = kcalloc(npages, sizeof(*pages), GFP_KERNEL);
-	if (!pages) {
-		SDMA_DBG(req, "Failed page array alloc");
+	if (!pages)
 		return -ENOMEM;
-	}
 	memcpy(pages, node->pages, node->npages * sizeof(*pages));
 
 	npages -= node->npages;
@@ -1249,20 +1243,25 @@ static int set_txreq_header_ahg(struct user_sdma_request *req,
 				struct user_sdma_txreq *tx, u32 datalen)
 {
 	u32 ahg[AHG_KDETH_ARRAY_SIZE];
-	int diff = 0;
+	int idx = 0;
 	u8 omfactor; /* KDETH.OM */
 	struct hfi1_user_sdma_pkt_q *pq = req->pq;
 	struct hfi1_pkt_header *hdr = &req->hdr;
 	u16 pbclen = le16_to_cpu(hdr->pbc[0]);
 	u32 val32, tidval = 0, lrhlen = get_lrh_len(*hdr, pad_len(datalen));
+	size_t array_size = ARRAY_SIZE(ahg);
 
 	if (PBC2LRH(pbclen) != lrhlen) {
 		/* PBC.PbcLengthDWs */
-		AHG_HEADER_SET(ahg, diff, 0, 0, 12,
-			       cpu_to_le16(LRH2PBC(lrhlen)));
+		idx = ahg_header_set(ahg, idx, array_size, 0, 0, 12,
+				     (__force u16)cpu_to_le16(LRH2PBC(lrhlen)));
+		if (idx < 0)
+			return idx;
 		/* LRH.PktLen (we need the full 16 bits due to byte swap) */
-		AHG_HEADER_SET(ahg, diff, 3, 0, 16,
-			       cpu_to_be16(lrhlen >> 2));
+		idx = ahg_header_set(ahg, idx, array_size, 3, 0, 16,
+				     (__force u16)cpu_to_be16(lrhlen >> 2));
+		if (idx < 0)
+			return idx;
 	}
 
 	/*
@@ -1273,12 +1272,23 @@ static int set_txreq_header_ahg(struct user_sdma_request *req,
 		(HFI1_CAP_IS_KSET(EXTENDED_PSN) ? 0x7fffffff : 0xffffff);
 	if (unlikely(tx->flags & TXREQ_FLAGS_REQ_ACK))
 		val32 |= 1UL << 31;
-	AHG_HEADER_SET(ahg, diff, 6, 0, 16, cpu_to_be16(val32 >> 16));
-	AHG_HEADER_SET(ahg, diff, 6, 16, 16, cpu_to_be16(val32 & 0xffff));
+	idx = ahg_header_set(ahg, idx, array_size, 6, 0, 16,
+			     (__force u16)cpu_to_be16(val32 >> 16));
+	if (idx < 0)
+		return idx;
+	idx = ahg_header_set(ahg, idx, array_size, 6, 16, 16,
+			     (__force u16)cpu_to_be16(val32 & 0xffff));
+	if (idx < 0)
+		return idx;
 	/* KDETH.Offset */
-	AHG_HEADER_SET(ahg, diff, 15, 0, 16,
-		       cpu_to_le16(req->koffset & 0xffff));
-	AHG_HEADER_SET(ahg, diff, 15, 16, 16, cpu_to_le16(req->koffset >> 16));
+	idx = ahg_header_set(ahg, idx, array_size, 15, 0, 16,
+			     (__force u16)cpu_to_le16(req->koffset & 0xffff));
+	if (idx < 0)
+		return idx;
+	idx = ahg_header_set(ahg, idx, array_size, 15, 16, 16,
+			     (__force u16)cpu_to_le16(req->koffset >> 16));
+	if (idx < 0)
+		return idx;
 	if (req_opcode(req->info.ctrl) == EXPECTED) {
 		__le16 val;
 
@@ -1305,10 +1315,13 @@ static int set_txreq_header_ahg(struct user_sdma_request *req,
 				 KDETH_OM_MAX_SIZE) ? KDETH_OM_LARGE_SHIFT :
 				 KDETH_OM_SMALL_SHIFT;
 		/* KDETH.OM and KDETH.OFFSET (TID) */
-		AHG_HEADER_SET(ahg, diff, 7, 0, 16,
-			       ((!!(omfactor - KDETH_OM_SMALL_SHIFT)) << 15 |
+		idx = ahg_header_set(
+				ahg, idx, array_size, 7, 0, 16,
+				((!!(omfactor - KDETH_OM_SMALL_SHIFT)) << 15 |
 				((req->tidoffset >> omfactor)
-				 & 0x7fff)));
+				& 0x7fff)));
+		if (idx < 0)
+			return idx;
 		/* KDETH.TIDCtrl, KDETH.TID, KDETH.Intr, KDETH.SH */
 		val = cpu_to_le16(((EXP_TID_GET(tidval, CTRL) & 0x3) << 10) |
 				   (EXP_TID_GET(tidval, IDX) & 0x3ff));
@@ -1325,21 +1338,22 @@ static int set_txreq_header_ahg(struct user_sdma_request *req,
 					     AHG_KDETH_INTR_SHIFT));
 		}
 
-		AHG_HEADER_SET(ahg, diff, 7, 16, 14, val);
+		idx = ahg_header_set(ahg, idx, array_size,
+				     7, 16, 14, (__force u16)val);
+		if (idx < 0)
+			return idx;
 	}
-	if (diff < 0)
-		return diff;
 
 	trace_hfi1_sdma_user_header_ahg(pq->dd, pq->ctxt, pq->subctxt,
 					req->info.comp_idx, req->sde->this_idx,
-					req->ahg_idx, ahg, diff, tidval);
+					req->ahg_idx, ahg, idx, tidval);
 	sdma_txinit_ahg(&tx->txreq,
 			SDMA_TXREQ_F_USE_AHG,
-			datalen, req->ahg_idx, diff,
+			datalen, req->ahg_idx, idx,
 			ahg, sizeof(req->hdr),
 			user_sdma_txreq_cb);
 
-	return diff;
+	return idx;
 }
 
 /**
@@ -1395,6 +1409,8 @@ static inline void pq_update(struct hfi1_user_sdma_pkt_q *pq)
 
 static void user_sdma_free_request(struct user_sdma_request *req, bool unpin)
 {
+	int i;
+
 	if (!list_empty(&req->txps)) {
 		struct sdma_txreq *t, *p;
 
@@ -1406,24 +1422,22 @@ static void user_sdma_free_request(struct user_sdma_request *req, bool unpin)
 			kmem_cache_free(req->pq->txreq_cache, tx);
 		}
 	}
-	if (req->data_iovs) {
-		struct sdma_mmu_node *node;
-		int i;
 
-		for (i = 0; i < req->data_iovs; i++) {
-			node = req->iovs[i].node;
-			if (!node)
-				continue;
+	for (i = 0; i < req->data_iovs; i++) {
+		struct sdma_mmu_node *node = req->iovs[i].node;
 
-			req->iovs[i].node = NULL;
+		if (!node)
+			continue;
 
-			if (unpin)
-				hfi1_mmu_rb_remove(req->pq->handler,
-						   &node->rb);
-			else
-				atomic_dec(&node->refcount);
-		}
+		req->iovs[i].node = NULL;
+
+		if (unpin)
+			hfi1_mmu_rb_remove(req->pq->handler,
+					   &node->rb);
+		else
+			atomic_dec(&node->refcount);
 	}
+
 	kfree(req->tids);
 	clear_bit(req->info.comp_idx, req->pq->req_in_use);
 }

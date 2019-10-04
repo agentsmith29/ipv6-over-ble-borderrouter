@@ -26,6 +26,7 @@
 #include <linux/if_pppox.h>
 #include <linux/ppp_defs.h>
 #include <linux/netfilter_bridge.h>
+#include <uapi/linux/netfilter_bridge.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6.h>
 #include <linux/netfilter_arp.h>
@@ -214,7 +215,7 @@ static int br_validate_ipv4(struct net *net, struct sk_buff *skb)
 
 	iph = ip_hdr(skb);
 	if (unlikely(ip_fast_csum((u8 *)iph, iph->ihl)))
-		goto inhdr_error;
+		goto csum_error;
 
 	len = ntohs(iph->tot_len);
 	if (skb->len < len) {
@@ -236,6 +237,8 @@ static int br_validate_ipv4(struct net *net, struct sk_buff *skb)
 	 */
 	return 0;
 
+csum_error:
+	__IP_INC_STATS(net, IPSTATS_MIB_CSUMERRORS);
 inhdr_error:
 	__IP_INC_STATS(net, IPSTATS_MIB_INHDRERRORS);
 drop:
@@ -512,6 +515,7 @@ static unsigned int br_nf_pre_routing(void *priv,
 	nf_bridge->ipv4_daddr = ip_hdr(skb)->daddr;
 
 	skb->protocol = htons(ETH_P_IP);
+	skb->transport_header = skb->network_header + ip_hdr(skb)->ihl * 4;
 
 	NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING, state->net, state->sk, skb,
 		skb->dev, NULL,
@@ -881,11 +885,6 @@ static const struct nf_br_ops br_ops = {
 	.br_dev_xmit_hook =	br_nf_dev_xmit,
 };
 
-void br_netfilter_enable(void)
-{
-}
-EXPORT_SYMBOL_GPL(br_netfilter_enable);
-
 /* For br_nf_post_routing, we need (prio = NF_BR_PRI_LAST), because
  * br_dev_queue_push_xmit is called afterwards */
 static const struct nf_hook_ops br_nf_ops[] = {
@@ -992,7 +991,7 @@ int br_nf_hook_thresh(unsigned int hook, struct net *net,
 	unsigned int i;
 	int ret;
 
-	e = rcu_dereference(net->nf.hooks[NFPROTO_BRIDGE][hook]);
+	e = rcu_dereference(net->nf.hooks_bridge[hook]);
 	if (!e)
 		return okfn(net, sk, skb);
 

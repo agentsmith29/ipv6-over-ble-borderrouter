@@ -139,8 +139,6 @@ enum rxe_qp_state {
 	QP_STATE_ERROR
 };
 
-extern char *rxe_qp_state_name[];
-
 struct rxe_req_info {
 	enum rxe_qp_state	state;
 	int			wqe_index;
@@ -214,6 +212,7 @@ struct rxe_resp_info {
 	struct rxe_mem		*mr;
 	u32			resid;
 	u32			rkey;
+	u32			length;
 	u64			atomic_orig;
 
 	/* SRQ only */

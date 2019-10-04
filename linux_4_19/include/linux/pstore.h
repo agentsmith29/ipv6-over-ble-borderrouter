@@ -26,7 +26,7 @@
 #include <linux/errno.h>
 #include <linux/kmsg_dump.h>
 #include <linux/mutex.h>
-#include <linux/spinlock.h>
+#include <linux/semaphore.h>
 #include <linux/time.h>
 #include <linux/types.h>
 
@@ -71,7 +71,7 @@ struct pstore_record {
 	struct pstore_info	*psi;
 	enum pstore_type_id	type;
 	u64			id;
-	struct timespec		time;
+	struct timespec64	time;
 	char			*buf;
 	ssize_t			size;
 	ssize_t			ecc_notice_size;
@@ -88,7 +88,7 @@ struct pstore_record {
  * @owner:	module which is repsonsible for this backend driver
  * @name:	name of the backend driver
  *
- * @buf_lock:	spinlock to serialize access to @buf
+ * @buf_lock:	semaphore to serialize access to @buf
  * @buf:	preallocated crash dump buffer
  * @bufsize:	size of @buf available for crash dump bytes (must match
  *		smallest number of bytes available for writing to a
@@ -173,7 +173,7 @@ struct pstore_info {
 	struct module	*owner;
 	char		*name;
 
-	spinlock_t	buf_lock;
+	struct semaphore buf_lock;
 	char		*buf;
 	size_t		bufsize;
 
@@ -199,7 +199,6 @@ struct pstore_info {
 
 extern int pstore_register(struct pstore_info *);
 extern void pstore_unregister(struct pstore_info *);
-extern bool pstore_cannot_block_path(enum kmsg_dump_reason reason);
 
 struct pstore_ftrace_record {
 	unsigned long ip;

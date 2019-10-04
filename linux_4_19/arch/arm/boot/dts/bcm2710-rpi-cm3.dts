@@ -1,10 +1,12 @@
 /dts-v1/;
 
 #include "bcm2710.dtsi"
+#include "bcm2709-rpi.dtsi"
 #include "bcm283x-rpi-csi0-2lane.dtsi"
 #include "bcm283x-rpi-csi1-4lane.dtsi"
 
 / {
+	compatible = "raspberrypi,3-compute-module", "brcm,bcm2837";
 	model = "Raspberry Pi Compute Module 3";
 };
 
@@ -53,11 +55,13 @@
 		status = "okay";
 	};
 
+};
+
+&firmware {
 	expgpio: expgpio {
-		compatible = "brcm,bcm2835-expgpio";
+		compatible = "raspberrypi,firmware-gpio";
 		gpio-controller;
 		#gpio-cells = <2>;
-		firmware = <&firmware>;
 		status = "okay";
 	};
 };

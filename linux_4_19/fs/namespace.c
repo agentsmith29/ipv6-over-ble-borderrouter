@@ -61,9 +61,6 @@ __setup("mphash_entries=", set_mphash_entries);
 static u64 event;
 static DEFINE_IDA(mnt_id_ida);
 static DEFINE_IDA(mnt_group_ida);
-static DEFINE_SPINLOCK(mnt_id_lock);
-static int mnt_id_start = 0;
-static int mnt_group_start = 1;
 
 static struct hlist_head *mount_hashtable __read_mostly;
 static struct hlist_head *mountpoint_hashtable __read_mostly;
@@ -101,50 +98,30 @@ static inline struct hlist_head *mp_hash(struct dentry *dentry)
 
 static int mnt_alloc_id(struct mount *mnt)
 {
-	int res;
+	int res = ida_alloc(&mnt_id_ida, GFP_KERNEL);
 
-retry:
-	ida_pre_get(&mnt_id_ida, GFP_KERNEL);
-	spin_lock(&mnt_id_lock);
-	res = ida_get_new_above(&mnt_id_ida, mnt_id_start, &mnt->mnt_id);
-	if (!res)
-		mnt_id_start = mnt->mnt_id + 1;
-	spin_unlock(&mnt_id_lock);
-	if (res == -EAGAIN)
-		goto retry;
-
-	return res;
+	if (res < 0)
+		return res;
+	mnt->mnt_id = res;
+	return 0;
 }
 
 static void mnt_free_id(struct mount *mnt)
 {
-	int id = mnt->mnt_id;
-	spin_lock(&mnt_id_lock);
-	ida_remove(&mnt_id_ida, id);
-	if (mnt_id_start > id)
-		mnt_id_start = id;
-	spin_unlock(&mnt_id_lock);
+	ida_free(&mnt_id_ida, mnt->mnt_id);
 }
 
 /*
  * Allocate a new peer group ID
- *
- * mnt_group_ida is protected by namespace_sem
  */
 static int mnt_alloc_group_id(struct mount *mnt)
 {
-	int res;
+	int res = ida_alloc_min(&mnt_group_ida, 1, GFP_KERNEL);
 
-	if (!ida_pre_get(&mnt_group_ida, GFP_KERNEL))
-		return -ENOMEM;
-
-	res = ida_get_new_above(&mnt_group_ida,
-				mnt_group_start,
-				&mnt->mnt_group_id);
-	if (!res)
-		mnt_group_start = mnt->mnt_group_id + 1;
-
-	return res;
+	if (res < 0)
+		return res;
+	mnt->mnt_group_id = res;
+	return 0;
 }
 
 /*
@@ -152,10 +129,7 @@ static int mnt_alloc_group_id(struct mount *mnt)
  */
 void mnt_release_group_id(struct mount *mnt)
 {
-	int id = mnt->mnt_group_id;
-	ida_remove(&mnt_group_ida, id);
-	if (mnt_group_start > id)
-		mnt_group_start = id;
+	ida_free(&mnt_group_ida, mnt->mnt_group_id);
 	mnt->mnt_group_id = 0;
 }
 
@@ -353,7 +327,7 @@ int __mnt_want_write(struct vfsmount *m)
 	 * incremented count after it has set MNT_WRITE_HOLD.
 	 */
 	smp_mb();
-	while (ACCESS_ONCE(mnt->mnt.mnt_flags) & MNT_WRITE_HOLD)
+	while (READ_ONCE(mnt->mnt.mnt_flags) & MNT_WRITE_HOLD)
 		cpu_relax();
 	/*
 	 * After the slowpath clears MNT_WRITE_HOLD, mnt_is_readonly will
@@ -431,74 +405,20 @@ int __mnt_want_write_file(struct file *file)
 }
 
 /**
- * mnt_want_write_file_path - get write access to a file's mount
- * @file: the file who's mount on which to take a write
- *
- * This is like mnt_want_write, but it takes a file and can
- * do some optimisations if the file is open for write already
- *
- * Called by the vfs for cases when we have an open file at hand, but will do an
- * inode operation on it (important distinction for files opened on overlayfs,
- * since the file operations will come from the real underlying file, while
- * inode operations come from the overlay).
- */
-int mnt_want_write_file_path(struct file *file)
-{
-	int ret;
-
-	sb_start_write(file->f_path.mnt->mnt_sb);
-	ret = __mnt_want_write_file(file);
-	if (ret)
-		sb_end_write(file->f_path.mnt->mnt_sb);
-	return ret;
-}
-
-static inline int may_write_real(struct file *file)
-{
-	struct dentry *dentry = file->f_path.dentry;
-	struct dentry *upperdentry;
-
-	/* Writable file? */
-	if (file->f_mode & FMODE_WRITER)
-		return 0;
-
-	/* Not overlayfs? */
-	if (likely(!(dentry->d_flags & DCACHE_OP_REAL)))
-		return 0;
-
-	/* File refers to upper, writable layer? */
-	upperdentry = d_real(dentry, NULL, 0, D_REAL_UPPER);
-	if (upperdentry &&
-	    (file_inode(file) == d_inode(upperdentry) ||
-	     file_inode(file) == d_inode(dentry)))
-		return 0;
-
-	/* Lower layer: can't write to real file, sorry... */
-	return -EPERM;
-}
-
-/**
  * mnt_want_write_file - get write access to a file's mount
  * @file: the file who's mount on which to take a write
  *
  * This is like mnt_want_write, but it takes a file and can
  * do some optimisations if the file is open for write already
- *
- * Mostly called by filesystems from their ioctl operation before performing
- * modification.  On overlayfs this needs to check if the file is on a read-only
- * lower layer and deny access in that case.
  */
 int mnt_want_write_file(struct file *file)
 {
 	int ret;
 
-	ret = may_write_real(file);
-	if (!ret) {
-		sb_start_write(file_inode(file)->i_sb);
-		ret = __mnt_want_write_file(file);
-		if (ret)
-			sb_end_write(file_inode(file)->i_sb);
-	}
+	sb_start_write(file_inode(file)->i_sb);
+	ret = __mnt_want_write_file(file);
+	if (ret)
+		sb_end_write(file_inode(file)->i_sb);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mnt_want_write_file);
@@ -538,14 +458,9 @@ void __mnt_drop_write_file(struct file *file)
 	__mnt_drop_write(file->f_path.mnt);
 }
 
-void mnt_drop_write_file_path(struct file *file)
-{
-	mnt_drop_write(file->f_path.mnt);
-}
-
 void mnt_drop_write_file(struct file *file)
 {
-	__mnt_drop_write(file->f_path.mnt);
+	__mnt_drop_write_file(file);
 	sb_end_write(file_inode(file)->i_sb);
 }
 EXPORT_SYMBOL(mnt_drop_write_file);
@@ -780,9 +695,6 @@ static struct mountpoint *lookup_mountpoint(struct dentry *dentry)
 
 	hlist_for_each_entry(mp, chain, m_hash) {
 		if (mp->m_dentry == dentry) {
-			/* might be worth a WARN_ON() */
-			if (d_unlinked(dentry))
-				return ERR_PTR(-ENOENT);
 			mp->m_count++;
 			return mp;
 		}
@@ -796,6 +708,9 @@ static struct mountpoint *get_mountpoint(struct dentry *dentry)
 	int ret;
 
 	if (d_mountpoint(dentry)) {
+		/* might be worth a WARN_ON() */
+		if (d_unlinked(dentry))
+			return ERR_PTR(-ENOENT);
 mountpoint:
 		read_seqlock_excl(&mount_lock);
 		mp = lookup_mountpoint(dentry);
@@ -1614,7 +1529,7 @@ static int do_umount(struct mount *mnt, int flags)
 		 * Special case for "unmounting" root ...
 		 * we just try to remount it readonly.
 		 */
-		if (!capable(CAP_SYS_ADMIN))
+		if (!ns_capable(sb->s_user_ns, CAP_SYS_ADMIN))
 			return -EPERM;
 		down_write(&sb->s_umount);
 		if (!sb_rdonly(sb))
@@ -1711,7 +1626,7 @@ static inline bool may_mandlock(void)
  * unixes. Our API is identical to OSF/1 to avoid making a mess of AMD
  */
 
-SYSCALL_DEFINE2(umount, char __user *, name, int, flags)
+int ksys_umount(char __user *name, int flags)
 {
 	struct path path;
 	struct mount *mnt;
@@ -1751,6 +1666,11 @@ out:
 	return retval;
 }
 
+SYSCALL_DEFINE2(umount, char __user *, name, int, flags)
+{
+	return ksys_umount(name, flags);
+}
+
 #ifdef __ARCH_WANT_SYS_OLDUMOUNT
 
 /*
@@ -1758,7 +1678,7 @@ out:
  */
 SYSCALL_DEFINE1(oldumount, char __user *, name)
 {
-	return sys_umount(name, 0);
+	return ksys_umount(name, 0);
 }
 
 #endif
@@ -2364,7 +2284,7 @@ static int do_remount(struct path *path, int ms_flags, int sb_flags,
 	down_write(&sb->s_umount);
 	if (ms_flags & MS_BIND)
 		err = change_mount_flags(path->mnt, ms_flags);
-	else if (!capable(CAP_SYS_ADMIN))
+	else if (!ns_capable(sb->s_user_ns, CAP_SYS_ADMIN))
 		err = -EPERM;
 	else
 		err = do_remount_sb(sb, sb_flags, data, 0);
@@ -3069,8 +2989,8 @@ struct dentry *mount_subtree(struct vfsmount *mnt, const char *name)
 }
 EXPORT_SYMBOL(mount_subtree);
 
-SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
-		char __user *, type, unsigned long, flags, void __user *, data)
+int ksys_mount(char __user *dev_name, char __user *dir_name, char __user *type,
+	       unsigned long flags, void __user *data)
 {
 	int ret;
 	char *kernel_type;
@@ -3101,6 +3021,12 @@ out_dev:
 	kfree(kernel_type);
 out_type:
 	return ret;
+}
+
+SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
+		char __user *, type, unsigned long, flags, void __user *, data)
+{
+	return ksys_mount(dev_name, dir_name, type, flags, data);
 }
 
 /*

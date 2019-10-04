@@ -89,9 +89,12 @@ void iptunnel_xmit(struct sock *sk, struct rtable *rt, struct sk_buff *skb,
 	__ip_select_ident(net, iph, skb_shinfo(skb)->gso_segs ?: 1);
 
 	err = ip_local_out(net, sk, skb);
-	if (unlikely(net_xmit_eval(err)))
-		pkt_len = 0;
-	iptunnel_xmit_stats(dev, pkt_len);
+
+	if (dev) {
+		if (unlikely(net_xmit_eval(err)))
+			pkt_len = 0;
+		iptunnel_xmit_stats(dev, pkt_len);
+	}
 }
 EXPORT_SYMBOL_GPL(iptunnel_xmit);
 
@@ -423,17 +426,17 @@ void __init ip_tunnel_core_init(void)
 	lwtunnel_encap_add_ops(&ip6_tun_lwt_ops, LWTUNNEL_ENCAP_IP6);
 }
 
-struct static_key ip_tunnel_metadata_cnt = STATIC_KEY_INIT_FALSE;
+DEFINE_STATIC_KEY_FALSE(ip_tunnel_metadata_cnt);
 EXPORT_SYMBOL(ip_tunnel_metadata_cnt);
 
 void ip_tunnel_need_metadata(void)
 {
-	static_key_slow_inc(&ip_tunnel_metadata_cnt);
+	static_branch_inc(&ip_tunnel_metadata_cnt);
 }
 EXPORT_SYMBOL_GPL(ip_tunnel_need_metadata);
 
 void ip_tunnel_unneed_metadata(void)
 {
-	static_key_slow_dec(&ip_tunnel_metadata_cnt);
+	static_branch_dec(&ip_tunnel_metadata_cnt);
 }
 EXPORT_SYMBOL_GPL(ip_tunnel_unneed_metadata);

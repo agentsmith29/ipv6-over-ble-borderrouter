@@ -510,11 +510,11 @@ static int ath10k_sdio_mbox_alloc_pkt_bundle(struct ath10k *ar,
 
 	*bndl_cnt = FIELD_GET(ATH10K_HTC_FLAG_BUNDLE_MASK, htc_hdr->flags);
 
-	if (*bndl_cnt > HTC_HOST_MAX_MSG_PER_BUNDLE) {
+	if (*bndl_cnt > HTC_HOST_MAX_MSG_PER_RX_BUNDLE) {
 		ath10k_warn(ar,
 			    "HTC bundle length %u exceeds maximum %u\n",
 			    le16_to_cpu(htc_hdr->len),
-			    HTC_HOST_MAX_MSG_PER_BUNDLE);
+			    HTC_HOST_MAX_MSG_PER_RX_BUNDLE);
 		return -ENOMEM;
 	}
 
@@ -605,11 +605,18 @@ static int ath10k_sdio_mbox_rx_alloc(struct ath10k *ar,
 		 * ATH10K_HTC_FLAG_BUNDLE_MASK flag set, all bundled
 		 * packet skb's have been allocated in the previous step.
 		 */
+		if (htc_hdr->flags & ATH10K_HTC_FLAGS_RECV_1MORE_BLOCK)
+			full_len += ATH10K_HIF_MBOX_BLOCK_SIZE;
+
 		ret = ath10k_sdio_mbox_alloc_rx_pkt(&ar_sdio->rx_pkts[i],
 						    act_len,
 						    full_len,
 						    last_in_bundle,
 						    last_in_bundle);
+		if (ret) {
+			ath10k_warn(ar, "alloc_rx_pkt error %d\n", ret);
+			goto err;
+		}
 	}
 
 	ar_sdio->n_rx_pkts = i;
@@ -1964,25 +1971,25 @@ static int ath10k_sdio_probe(struct sdio_func *func,
 	ar_sdio = ath10k_sdio_priv(ar);
 
 	ar_sdio->irq_data.irq_proc_reg =
-		kzalloc(sizeof(struct ath10k_sdio_irq_proc_regs),
-			GFP_KERNEL);
+		devm_kzalloc(ar->dev, sizeof(struct ath10k_sdio_irq_proc_regs),
+			     GFP_KERNEL);
 	if (!ar_sdio->irq_data.irq_proc_reg) {
 		ret = -ENOMEM;
 		goto err_core_destroy;
 	}
 
 	ar_sdio->irq_data.irq_en_reg =
-		kzalloc(sizeof(struct ath10k_sdio_irq_enable_regs),
-			GFP_KERNEL);
+		devm_kzalloc(ar->dev, sizeof(struct ath10k_sdio_irq_enable_regs),
+			     GFP_KERNEL);
 	if (!ar_sdio->irq_data.irq_en_reg) {
 		ret = -ENOMEM;
-		goto err_free_proc_reg;
+		goto err_core_destroy;
 	}
 
-	ar_sdio->bmi_buf = kzalloc(BMI_MAX_CMDBUF_SIZE, GFP_KERNEL);
+	ar_sdio->bmi_buf = devm_kzalloc(ar->dev, BMI_MAX_CMDBUF_SIZE, GFP_KERNEL);
 	if (!ar_sdio->bmi_buf) {
 		ret = -ENOMEM;
-		goto err_free_en_reg;
+		goto err_core_destroy;
 	}
 
 	ar_sdio->func = func;
@@ -2002,7 +2009,7 @@ static int ath10k_sdio_probe(struct sdio_func *func,
 	ar_sdio->workqueue = create_singlethread_workqueue("ath10k_sdio_wq");
 	if (!ar_sdio->workqueue) {
 		ret = -ENOMEM;
-		goto err_free_bmi_buf;
+		goto err_core_destroy;
 	}
 
 	for (i = 0; i < ATH10K_SDIO_BUS_REQUEST_MAX_NUM; i++)
@@ -2018,7 +2025,7 @@ static int ath10k_sdio_probe(struct sdio_func *func,
 		ret = -ENODEV;
 		ath10k_err(ar, "unsupported device id %u (0x%x)\n",
 			   dev_id_base, id->device);
-		goto err_free_bmi_buf;
+		goto err_free_wq;
 	}
 
 	ar->id.vendor = id->vendor;
@@ -2047,12 +2054,6 @@ static int ath10k_sdio_probe(struct sdio_func *func,
 
 err_free_wq:
 	destroy_workqueue(ar_sdio->workqueue);
-err_free_bmi_buf:
-	kfree(ar_sdio->bmi_buf);
-err_free_en_reg:
-	kfree(ar_sdio->irq_data.irq_en_reg);
-err_free_proc_reg:
-	kfree(ar_sdio->irq_data.irq_proc_reg);
 err_core_destroy:
 	ath10k_core_destroy(ar);
 
@@ -2072,6 +2073,9 @@ static void ath10k_sdio_remove(struct sdio_func *func)
 	cancel_work_sync(&ar_sdio->wr_async_work);
 	ath10k_core_unregister(ar);
 	ath10k_core_destroy(ar);
+
+	flush_workqueue(ar_sdio->workqueue);
+	destroy_workqueue(ar_sdio->workqueue);
 }
 
 static const struct sdio_device_id ath10k_sdio_devices[] = {

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  *  S390 version
  *    Copyright IBM Corp. 1999, 2012
@@ -55,12 +56,12 @@
 #include <asm/mmu_context.h>
 #include <asm/cpcmd.h>
 #include <asm/lowcore.h>
+#include <asm/nmi.h>
 #include <asm/irq.h>
 #include <asm/page.h>
 #include <asm/ptrace.h>
 #include <asm/sections.h>
 #include <asm/ebcdic.h>
-#include <asm/kvm_virtio.h>
 #include <asm/diag.h>
 #include <asm/os_info.h>
 #include <asm/sclp.h>
@@ -220,6 +221,8 @@ static void __init conmode_default(void)
 		SET_CONSOLE_SCLP;
 #endif
 	}
+	if (IS_ENABLED(CONFIG_VT) && IS_ENABLED(CONFIG_DUMMY_CONSOLE))
+		conswitchp = &dummy_con;
 }
 
 #ifdef CONFIG_CRASH_DUMP
@@ -300,7 +303,7 @@ early_param("vmalloc", parse_vmalloc);
 
 void *restart_stack __section(.data);
 
-static void __init setup_lowcore(void)
+static void __init setup_lowcore_dat_off(void)
 {
 	struct lowcore *lc;
 
@@ -311,19 +314,16 @@ static void __init setup_lowcore(void)
 	lc = memblock_virt_alloc_low(sizeof(*lc), sizeof(*lc));
 	lc->restart_psw.mask = PSW_KERNEL_BITS;
 	lc->restart_psw.addr = (unsigned long) restart_int_handler;
-	lc->external_new_psw.mask = PSW_KERNEL_BITS |
-		PSW_MASK_DAT | PSW_MASK_MCHECK;
+	lc->external_new_psw.mask = PSW_KERNEL_BITS | PSW_MASK_MCHECK;
 	lc->external_new_psw.addr = (unsigned long) ext_int_handler;
 	lc->svc_new_psw.mask = PSW_KERNEL_BITS |
-		PSW_MASK_DAT | PSW_MASK_IO | PSW_MASK_EXT | PSW_MASK_MCHECK;
+		PSW_MASK_IO | PSW_MASK_EXT | PSW_MASK_MCHECK;
 	lc->svc_new_psw.addr = (unsigned long) system_call;
-	lc->program_new_psw.mask = PSW_KERNEL_BITS |
-		PSW_MASK_DAT | PSW_MASK_MCHECK;
+	lc->program_new_psw.mask = PSW_KERNEL_BITS | PSW_MASK_MCHECK;
 	lc->program_new_psw.addr = (unsigned long) pgm_check_handler;
 	lc->mcck_new_psw.mask = PSW_KERNEL_BITS;
 	lc->mcck_new_psw.addr = (unsigned long) mcck_int_handler;
-	lc->io_new_psw.mask = PSW_KERNEL_BITS |
-		PSW_MASK_DAT | PSW_MASK_MCHECK;
+	lc->io_new_psw.mask = PSW_KERNEL_BITS | PSW_MASK_MCHECK;
 	lc->io_new_psw.addr = (unsigned long) io_int_handler;
 	lc->clock_comparator = clock_comparator_max;
 	lc->kernel_stack = ((unsigned long) &init_thread_union)
@@ -343,16 +343,8 @@ static void __init setup_lowcore(void)
 	       sizeof(lc->stfle_fac_list));
 	memcpy(lc->alt_stfle_fac_list, S390_lowcore.alt_stfle_fac_list,
 	       sizeof(lc->alt_stfle_fac_list));
-	if (MACHINE_HAS_VX || MACHINE_HAS_GS) {
-		unsigned long bits, size;
-
-		bits = MACHINE_HAS_GS ? 11 : 10;
-		size = 1UL << bits;
-		lc->mcesad = (__u64) memblock_virt_alloc(size, size);
-		if (MACHINE_HAS_GS)
-			lc->mcesad |= bits;
-	}
-	lc->vdso_per_cpu_data = (unsigned long) &lc->paste[0];
+	nmi_alloc_boot_cpu(lc);
+	vdso_alloc_boot_cpu(lc);
 	lc->sync_enter_timer = S390_lowcore.sync_enter_timer;
 	lc->async_enter_timer = S390_lowcore.async_enter_timer;
 	lc->exit_timer = S390_lowcore.exit_timer;
@@ -384,11 +376,23 @@ static void __init setup_lowcore(void)
 
 #ifdef CONFIG_SMP
 	lc->spinlock_lockval = arch_spin_lockval(0);
+	lc->spinlock_index = 0;
+	arch_spin_lock_setup(0);
 #endif
 	lc->br_r1_trampoline = 0x07f1;	/* br %r1 */
 
 	set_prefix((u32)(unsigned long) lc);
 	lowcore_ptr[0] = lc;
+}
+
+static void __init setup_lowcore_dat_on(void)
+{
+	__ctl_clear_bit(0, 28);
+	S390_lowcore.external_new_psw.mask |= PSW_MASK_DAT;
+	S390_lowcore.svc_new_psw.mask |= PSW_MASK_DAT;
+	S390_lowcore.program_new_psw.mask |= PSW_MASK_DAT;
+	S390_lowcore.io_new_psw.mask |= PSW_MASK_DAT;
+	__ctl_set_bit(0, 28);
 }
 
 static struct resource code_resource = {
@@ -418,12 +422,12 @@ static void __init setup_resources(void)
 	struct memblock_region *reg;
 	int j;
 
-	code_resource.start = (unsigned long) &_text;
-	code_resource.end = (unsigned long) &_etext - 1;
-	data_resource.start = (unsigned long) &_etext;
-	data_resource.end = (unsigned long) &_edata - 1;
-	bss_resource.start = (unsigned long) &__bss_start;
-	bss_resource.end = (unsigned long) &__bss_stop - 1;
+	code_resource.start = (unsigned long) _text;
+	code_resource.end = (unsigned long) _etext - 1;
+	data_resource.start = (unsigned long) _etext;
+	data_resource.end = (unsigned long) _edata - 1;
+	bss_resource.start = (unsigned long) __bss_start;
+	bss_resource.end = (unsigned long) __bss_stop - 1;
 
 	for_each_memblock(memory, reg) {
 		res = memblock_virt_alloc(sizeof(*res), 8);
@@ -672,17 +676,17 @@ static void __init check_initrd(void)
  */
 static void __init reserve_kernel(void)
 {
-	unsigned long start_pfn = PFN_UP(__pa(&_end));
+	unsigned long start_pfn = PFN_UP(__pa(_end));
 
 #ifdef CONFIG_DMA_API_DEBUG
 	/*
 	 * DMA_API_DEBUG code stumbles over addresses from the
-	 * range [_ehead, _stext]. Mark the memory as reserved
+	 * range [PARMAREA_END, _stext]. Mark the memory as reserved
 	 * so it is not used for CONFIG_DMA_API_DEBUG=y.
 	 */
 	memblock_reserve(0, PFN_PHYS(start_pfn));
 #else
-	memblock_reserve(0, (unsigned long)_ehead);
+	memblock_reserve(0, PARMAREA_END);
 	memblock_reserve((unsigned long)_stext, PFN_PHYS(start_pfn)
 			 - (unsigned long)_stext);
 #endif
@@ -769,7 +773,7 @@ static int __init setup_hwcaps(void)
 	/*
 	 * Transactional execution support HWCAP_S390_TE is bit 10.
 	 */
-	if (test_facility(50) && test_facility(73))
+	if (MACHINE_HAS_TE)
 		elf_hwcap |= HWCAP_S390_TE;
 
 	/*
@@ -824,6 +828,7 @@ static int __init setup_hwcaps(void)
 		strcpy(elf_platform, "z13");
 		break;
 	case 0x3906:
+	case 0x3907:
 		strcpy(elf_platform, "z14");
 		break;
 	}
@@ -884,6 +889,8 @@ void __init setup_arch(char **cmdline_p)
 		pr_info("Linux is running under KVM in 64-bit mode\n");
 	else if (MACHINE_IS_LPAR)
 		pr_info("Linux is running natively in 64-bit mode\n");
+	else
+		pr_info("Linux is running as a guest in 64-bit mode\n");
 
 	/* Have one command line that is parsed and saved in /proc/cmdline */
 	/* boot_command_line has been already set up in early.c */
@@ -893,9 +900,9 @@ void __init setup_arch(char **cmdline_p)
 
 	/* Is init_mm really needed? */
 	init_mm.start_code = PAGE_OFFSET;
-	init_mm.end_code = (unsigned long) &_etext;
-	init_mm.end_data = (unsigned long) &_edata;
-	init_mm.brk = (unsigned long) &_end;
+	init_mm.end_code = (unsigned long) _etext;
+	init_mm.end_data = (unsigned long) _edata;
+	init_mm.brk = (unsigned long) _end;
 
 	if (IS_ENABLED(CONFIG_EXPOLINE_AUTO))
 		nospec_auto_detect();
@@ -946,7 +953,7 @@ void __init setup_arch(char **cmdline_p)
 #endif
 
 	setup_resources();
-	setup_lowcore();
+	setup_lowcore_dat_off();
 	smp_fill_possible_mask();
 	cpu_detect_mhz_feature();
         cpu_init();
@@ -958,6 +965,12 @@ void __init setup_arch(char **cmdline_p)
 	 * Create kernel page tables and switch to virtual addressing.
 	 */
         paging_init();
+
+	/*
+	 * After paging_init created the kernel page table, the new PSWs
+	 * in lowcore can now run with DAT enabled.
+	 */
+	setup_lowcore_dat_on();
 
         /* Setup default console */
 	conmode_default();

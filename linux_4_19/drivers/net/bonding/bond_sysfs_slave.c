@@ -25,8 +25,8 @@ const struct slave_attribute slave_attr_##_name = {		\
 		 .mode = _mode },				\
 	.show	= _show,					\
 };
-#define SLAVE_ATTR_RO(_name) \
-	SLAVE_ATTR(_name, S_IRUGO, _name##_show)
+#define SLAVE_ATTR_RO(_name)					\
+	SLAVE_ATTR(_name, 0444, _name##_show)
 
 static ssize_t state_show(struct slave *slave, char *buf)
 {
@@ -55,7 +55,9 @@ static SLAVE_ATTR_RO(link_failure_count);
 
 static ssize_t perm_hwaddr_show(struct slave *slave, char *buf)
 {
-	return sprintf(buf, "%pM\n", slave->perm_hwaddr);
+	return sprintf(buf, "%*phC\n",
+		       slave->dev->addr_len,
+		       slave->perm_hwaddr);
 }
 static SLAVE_ATTR_RO(perm_hwaddr);
 

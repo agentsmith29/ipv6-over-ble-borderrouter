@@ -17,6 +17,7 @@
 #include <linux/bitrev.h>
 #include <linux/io.h>
 #include <linux/err.h>
+#include <linux/sizes.h>
 #include "ipu-prv.h"
 
 /* IC Register Offsets */
@@ -256,7 +257,7 @@ static int init_csc(struct ipu_ic *ic,
 	writel(param, base++);
 
 	param = ((a[0] & 0x1fe0) >> 5) | (params->scale << 8) |
-		(params->sat << 9);
+		(params->sat << 10);
 	writel(param, base++);
 
 	param = ((a[1] & 0x1f) << 27) | ((c[0][1] & 0x1ff) << 18) |

@@ -30,6 +30,7 @@
 #include <linux/elf.h>
 #include <linux/moduleloader.h>
 #include <linux/completion.h>
+#include <linux/memory.h>
 #include <asm/cacheflush.h>
 #include "core.h"
 #include "patch.h"
@@ -52,11 +53,6 @@ static struct kobject *klp_root_kobj;
 static bool klp_is_module(struct klp_object *obj)
 {
 	return obj->name;
-}
-
-static bool klp_is_object_loaded(struct klp_object *obj)
-{
-	return !obj->name || obj->mod;
 }
 
 /* sets obj->mod if object is not vmlinux and module is found */
@@ -285,6 +281,11 @@ static int klp_write_object_relocations(struct module *pmod,
 
 static int __klp_disable_patch(struct klp_patch *patch)
 {
+	struct klp_object *obj;
+
+	if (WARN_ON(!patch->enabled))
+		return -EINVAL;
+
 	if (klp_transition_patch)
 		return -EBUSY;
 
@@ -294,6 +295,10 @@ static int __klp_disable_patch(struct klp_patch *patch)
 		return -EBUSY;
 
 	klp_init_transition(patch, KLP_UNPATCHED);
+
+	klp_for_each_object(patch, obj)
+		if (obj->patched)
+			klp_pre_unpatch_callback(obj);
 
 	/*
 	 * Enforce the order of the func->transition writes in
@@ -362,11 +367,6 @@ static int __klp_enable_patch(struct klp_patch *patch)
 	/*
 	 * A reference is taken on the patch module to prevent it from being
 	 * unloaded.
-	 *
-	 * Note: For immediate (no consistency model) patches we don't allow
-	 * patch modules to unload since there is no safe/sane method to
-	 * determine if a thread is still running in the patched code contained
-	 * in the patch module once the ftrace registration is successful.
 	 */
 	if (!try_module_get(patch->mod))
 		return -ENODEV;
@@ -388,13 +388,18 @@ static int __klp_enable_patch(struct klp_patch *patch)
 		if (!klp_is_object_loaded(obj))
 			continue;
 
+		ret = klp_pre_patch_callback(obj);
+		if (ret) {
+			pr_warn("pre-patch callback failed for object '%s'\n",
+				klp_is_module(obj) ? obj->name : "vmlinux");
+			goto err;
+		}
+
 		ret = klp_patch_object(obj);
 		if (ret) {
-			pr_warn("failed to enable patch '%s'\n",
-				patch->mod->name);
-
-			klp_cancel_transition();
-			return ret;
+			pr_warn("failed to patch object '%s'\n",
+				klp_is_module(obj) ? obj->name : "vmlinux");
+			goto err;
 		}
 	}
 
@@ -403,6 +408,11 @@ static int __klp_enable_patch(struct klp_patch *patch)
 	patch->enabled = true;
 
 	return 0;
+err:
+	pr_warn("failed to enable patch '%s'\n", patch->mod->name);
+
+	klp_cancel_transition();
+	return ret;
 }
 
 /**
@@ -440,6 +450,8 @@ EXPORT_SYMBOL_GPL(klp_enable_patch);
  * /sys/kernel/livepatch/<patch>
  * /sys/kernel/livepatch/<patch>/enabled
  * /sys/kernel/livepatch/<patch>/transition
+ * /sys/kernel/livepatch/<patch>/signal
+ * /sys/kernel/livepatch/<patch>/force
  * /sys/kernel/livepatch/<patch>/<object>
  * /sys/kernel/livepatch/<patch>/<object>/<function,sympos>
  */
@@ -514,11 +526,73 @@ static ssize_t transition_show(struct kobject *kobj,
 			patch == klp_transition_patch);
 }
 
+static ssize_t signal_store(struct kobject *kobj, struct kobj_attribute *attr,
+			    const char *buf, size_t count)
+{
+	struct klp_patch *patch;
+	int ret;
+	bool val;
+
+	ret = kstrtobool(buf, &val);
+	if (ret)
+		return ret;
+
+	if (!val)
+		return count;
+
+	mutex_lock(&klp_mutex);
+
+	patch = container_of(kobj, struct klp_patch, kobj);
+	if (patch != klp_transition_patch) {
+		mutex_unlock(&klp_mutex);
+		return -EINVAL;
+	}
+
+	klp_send_signals();
+
+	mutex_unlock(&klp_mutex);
+
+	return count;
+}
+
+static ssize_t force_store(struct kobject *kobj, struct kobj_attribute *attr,
+			   const char *buf, size_t count)
+{
+	struct klp_patch *patch;
+	int ret;
+	bool val;
+
+	ret = kstrtobool(buf, &val);
+	if (ret)
+		return ret;
+
+	if (!val)
+		return count;
+
+	mutex_lock(&klp_mutex);
+
+	patch = container_of(kobj, struct klp_patch, kobj);
+	if (patch != klp_transition_patch) {
+		mutex_unlock(&klp_mutex);
+		return -EINVAL;
+	}
+
+	klp_force_transition();
+
+	mutex_unlock(&klp_mutex);
+
+	return count;
+}
+
 static struct kobj_attribute enabled_kobj_attr = __ATTR_RW(enabled);
 static struct kobj_attribute transition_kobj_attr = __ATTR_RO(transition);
+static struct kobj_attribute signal_kobj_attr = __ATTR_WO(signal);
+static struct kobj_attribute force_kobj_attr = __ATTR_WO(force);
 static struct attribute *klp_patch_attrs[] = {
 	&enabled_kobj_attr.attr,
 	&transition_kobj_attr.attr,
+	&signal_kobj_attr.attr,
+	&force_kobj_attr.attr,
 	NULL
 };
 
@@ -635,15 +709,20 @@ static int klp_init_object_loaded(struct klp_patch *patch,
 	struct klp_func *func;
 	int ret;
 
+	mutex_lock(&text_mutex);
+
 	module_disable_ro(patch->mod);
 	ret = klp_write_object_relocations(patch->mod, obj);
 	if (ret) {
 		module_enable_ro(patch->mod, true);
+		mutex_unlock(&text_mutex);
 		return ret;
 	}
 
 	arch_klp_init_object_loaded(patch, obj);
 	module_enable_ro(patch->mod, true);
+
+	mutex_unlock(&text_mutex);
 
 	klp_for_each_func(obj, func) {
 		ret = klp_find_object_symbol(obj->name, func->old_name,
@@ -822,12 +901,7 @@ int klp_register_patch(struct klp_patch *patch)
 	if (!klp_initialized())
 		return -ENODEV;
 
-	/*
-	 * Architectures without reliable stack traces have to set
-	 * patch->immediate because there's currently no way to patch kthreads
-	 * with the consistency model.
-	 */
-	if (!klp_have_reliable_stack() && !patch->immediate) {
+	if (!klp_have_reliable_stack()) {
 		pr_err("This architecture doesn't have support for the livepatch consistency model.\n");
 		return -ENOSYS;
 	}
@@ -860,9 +934,15 @@ static void klp_cleanup_module_patches_limited(struct module *mod,
 			 * is in transition.
 			 */
 			if (patch->enabled || patch == klp_transition_patch) {
+
+				if (patch != klp_transition_patch)
+					klp_pre_unpatch_callback(obj);
+
 				pr_notice("reverting patch '%s' on unloading module '%s'\n",
 					  patch->mod->name, obj->mod->name);
 				klp_unpatch_object(obj);
+
+				klp_post_unpatch_callback(obj);
 			}
 
 			klp_free_object_loaded(obj);
@@ -912,12 +992,24 @@ int klp_module_coming(struct module *mod)
 			pr_notice("applying patch '%s' to loading module '%s'\n",
 				  patch->mod->name, obj->mod->name);
 
+			ret = klp_pre_patch_callback(obj);
+			if (ret) {
+				pr_warn("pre-patch callback failed for object '%s'\n",
+					obj->name);
+				goto err;
+			}
+
 			ret = klp_patch_object(obj);
 			if (ret) {
 				pr_warn("failed to apply patch '%s' to module '%s' (%d)\n",
 					patch->mod->name, obj->mod->name, ret);
+
+				klp_post_unpatch_callback(obj);
 				goto err;
 			}
+
+			if (patch != klp_transition_patch)
+				klp_post_patch_callback(obj);
 
 			break;
 		}

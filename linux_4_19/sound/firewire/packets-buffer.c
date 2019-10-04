@@ -27,7 +27,7 @@ int iso_packets_buffer_init(struct iso_packets_buffer *b, struct fw_unit *unit,
 	void *p;
 	int err;
 
-	b->packets = kmalloc(count * sizeof(*b->packets), GFP_KERNEL);
+	b->packets = kmalloc_array(count, sizeof(*b->packets), GFP_KERNEL);
 	if (!b->packets) {
 		err = -ENOMEM;
 		goto error;
@@ -37,7 +37,7 @@ int iso_packets_buffer_init(struct iso_packets_buffer *b, struct fw_unit *unit,
 	packets_per_page = PAGE_SIZE / packet_size;
 	if (WARN_ON(!packets_per_page)) {
 		err = -EINVAL;
-		goto error;
+		goto err_packets;
 	}
 	pages = DIV_ROUND_UP(count, packets_per_page);
 

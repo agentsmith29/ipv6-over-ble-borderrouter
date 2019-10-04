@@ -1,23 +1,10 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause)
 /*
  * RocketPort device driver for Linux
  *
  * Written by Theodore Ts'o, 1995, 1996, 1997, 1998, 1999, 2000.
  * 
  * Copyright (C) 1995, 1996, 1997, 1998, 1999, 2000, 2003 by Comtrol, Inc.
- * 
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License as
- * published by the Free Software Foundation; either version 2 of the
- * License, or (at your option) any later version.
- * 
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- * 
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
 /*
@@ -99,7 +86,7 @@
 
 /****** RocketPort Local Variables ******/
 
-static void rp_do_poll(unsigned long dummy);
+static void rp_do_poll(struct timer_list *unused);
 
 static struct tty_driver *rocket_driver;
 
@@ -111,7 +98,7 @@ static struct r_port *rp_table[MAX_RP_PORTS];	       /*  The main repository of 
 static unsigned int xmit_flags[NUM_BOARDS];	       /*  Bit significant, indicates port had data to transmit. */
 						       /*  eg.  Bit 0 indicates port 0 has xmit data, ...        */
 static atomic_t rp_num_ports_open;	               /*  Number of serial ports open                           */
-static DEFINE_TIMER(rocket_timer, rp_do_poll, 0, 0);
+static DEFINE_TIMER(rocket_timer, rp_do_poll);
 
 static unsigned long board1;	                       /* ISA addresses, retrieved from rocketport.conf          */
 static unsigned long board2;
@@ -279,7 +266,7 @@ MODULE_PARM_DESC(pc104_3, "set interface types for ISA(PC104) board #3 (e.g. pc1
 module_param_array(pc104_4, ulong, NULL, 0);
 MODULE_PARM_DESC(pc104_4, "set interface types for ISA(PC104) board #4 (e.g. pc104_4=232,232,485,485,...");
 
-static int rp_init(void);
+static int __init rp_init(void);
 static void rp_cleanup_module(void);
 
 module_init(rp_init);
@@ -538,7 +525,7 @@ static void rp_handle_port(struct r_port *info)
 /*
  *  The top level polling routine.  Repeats every 1/100 HZ (10ms).
  */
-static void rp_do_poll(unsigned long dummy)
+static void rp_do_poll(struct timer_list *unused)
 {
 	CONTROLLER_t *ctlp;
 	int ctrl, aiop, ch, line;

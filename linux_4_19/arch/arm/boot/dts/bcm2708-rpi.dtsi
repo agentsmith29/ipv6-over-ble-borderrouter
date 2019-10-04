@@ -1,9 +1,9 @@
-/* Downstream version of bcm2835-rpi.dtsi */
+/* Downstream modifications to bcm2835-rpi.dtsi */
 
-#include <dt-bindings/power/raspberrypi-power.h>
+#include "bcm2835-rpi.dtsi"
 
 / {
-	memory {
+	memory@0 {
 		device_type = "memory";
 		reg = <0x0 0x0>;
 	};
@@ -35,7 +35,6 @@
 		usb = &usb;
 		leds = &leds;
 		fb = &fb;
-		vchiq = &vchiq;
 		thermal = &thermal;
 		axiperf = &axiperf;
 	};
@@ -50,29 +49,10 @@
 			reg = <0x7e200000 0x1000>;
 		};
 
-		firmware: firmware {
-			compatible = "raspberrypi,bcm2835-firmware";
-			mboxes = <&mailbox>;
-		};
-
-		power: power {
-			compatible = "raspberrypi,bcm2835-power";
-			firmware = <&firmware>;
-			#power-domain-cells = <1>;
-		};
-
 		fb: fb {
 			compatible = "brcm,bcm2708-fb";
 			firmware = <&firmware>;
-			status = "disabled";
-		};
-
-		vchiq: vchiq {
-			compatible = "brcm,bcm2835-vchiq";
-			reg = <0x7e00b840 0xf>;
-			interrupts = <0 2>;
-			cache-line-size = <32>;
-			firmware = <&firmware>;
+			status = "okay";
 		};
 
 		vcsm: vcsm {
@@ -95,7 +75,7 @@
 	};
 
 	__overrides__ {
-		cache_line_size = <&vchiq>, "cache-line-size:0";
+		cache_line_size;
 
 		uart0 = <&uart0>,"status";
 		uart1 = <&uart1>,"status";
@@ -115,25 +95,41 @@
 		sd_force_pio = <&sdhost>,"brcm,force-pio?";
 		sd_pio_limit = <&sdhost>,"brcm,pio-limit:0";
 		sd_debug     = <&sdhost>,"brcm,debug";
-		sdio_overclock = <&mmc>,"brcm,overclock-50:0";
+		sdio_overclock = <&mmc>,"brcm,overclock-50:0",
+				 <&mmcnr>,"brcm,overclock-50:0";
 		axiperf      = <&axiperf>,"status";
 	};
 };
 
-&dma {
-	brcm,dma-channel-mask = <0x7f34>;
-};
-
 &hdmi {
 	power-domains = <&power RPI_POWER_DOMAIN_HDMI>;
+	status = "disabled";
 };
 
-&usb {
-	power-domains = <&power RPI_POWER_DOMAIN_USB>;
+&txp {
+	status = "disabled";
+};
+
+&i2c0 {
+	status = "disabled";
+};
+
+&i2c1 {
+	status = "disabled";
+};
+
+&i2c2 {
+	status = "disabled";
 };
 
 &clocks {
 	firmware = <&firmware>;
+};
+
+&sdhci {
+	pinctrl-names = "default";
+	pinctrl-0 = <&emmc_gpio48>;
+	bus-width = <4>;
 };
 
 sdhost_pins: &sdhost_gpio48 {
@@ -149,22 +145,10 @@ sdhost_pins: &sdhost_gpio48 {
 	status = "okay";
 };
 
-&fb {
-	status = "okay";
-};
-
 &cpu_thermal {
 	/delete-node/ trips;
 };
 
 &vec {
 	status = "disabled";
-};
-
-&csi0 {
-	power-domains = <&power RPI_POWER_DOMAIN_UNICAM0>;
-};
-
-&csi1 {
-	power-domains = <&power RPI_POWER_DOMAIN_UNICAM1>;
 };

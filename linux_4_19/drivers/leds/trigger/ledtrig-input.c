@@ -18,10 +18,11 @@
 #include <linux/gpio.h>
 #include "../leds.h"
 
-static void input_trig_activate(struct led_classdev *led_cdev)
+static int input_trig_activate(struct led_classdev *led_cdev)
 {
 	led_cdev->flags |= SET_GPIO_INPUT;
 	led_set_brightness(led_cdev, 0);
+	return 0;
 }
 
 static void input_trig_deactivate(struct led_classdev *led_cdev)

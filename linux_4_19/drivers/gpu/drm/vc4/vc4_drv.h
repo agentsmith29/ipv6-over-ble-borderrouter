@@ -6,10 +6,15 @@
  * published by the Free Software Foundation.
  */
 
+#include <linux/mm_types.h>
 #include <linux/reservation.h>
 #include <drm/drmP.h>
 #include <drm/drm_encoder.h>
 #include <drm/drm_gem_cma_helper.h>
+#include <drm/drm_atomic.h>
+#include <drm/drm_syncobj.h>
+
+#include "uapi/drm/vc4_drm.h"
 
 /* Don't forget to update vc4_bo.c: bo_type_names[] when adding to
  * this.
@@ -29,6 +34,36 @@ enum vc4_kernel_bo_type {
 	VC4_BO_TYPE_COUNT
 };
 
+/* Performance monitor object. The perform lifetime is controlled by userspace
+ * using perfmon related ioctls. A perfmon can be attached to a submit_cl
+ * request, and when this is the case, HW perf counters will be activated just
+ * before the submit_cl is submitted to the GPU and disabled when the job is
+ * done. This way, only events related to a specific job will be counted.
+ */
+struct vc4_perfmon {
+	/* Tracks the number of users of the perfmon, when this counter reaches
+	 * zero the perfmon is destroyed.
+	 */
+	refcount_t refcnt;
+
+	/* Number of counters activated in this perfmon instance
+	 * (should be less than DRM_VC4_MAX_PERF_COUNTERS).
+	 */
+	u8 ncounters;
+
+	/* Events counted by the HW perf counters. */
+	u8 events[DRM_VC4_MAX_PERF_COUNTERS];
+
+	/* Storage for counter values. Counters are incremented by the HW
+	 * perf counter values every time the perfmon is attached to a GPU job.
+	 * This way, perfmon users don't have to retrieve the results after
+	 * each job if they want to track events covering several submissions.
+	 * Note that counter values can't be reset, but you can fake a reset by
+	 * destroying the perfmon and creating a new one.
+	 */
+	u64 counters[0];
+};
+
 struct vc4_dev {
 	struct drm_device *dev;
 
@@ -41,8 +76,8 @@ struct vc4_dev {
 	struct vc4_dpi *dpi;
 	struct vc4_dsi *dsi1;
 	struct vc4_vec *vec;
-
-	struct drm_fbdev_cma *fbdev;
+	struct vc4_txp *txp;
+	struct vc4_fkms *fkms;
 
 	struct vc4_hang_state *hang_state;
 
@@ -126,6 +161,11 @@ struct vc4_dev {
 	wait_queue_head_t job_wait_queue;
 	struct work_struct job_done_work;
 
+	/* Used to track the active perfmon if any. Access to this field is
+	 * protected by job_lock.
+	 */
+	struct vc4_perfmon *active_perfmon;
+
 	/* List of struct vc4_seqno_cb for callbacks to be made from a
 	 * workqueue when the given seqno is passed.
 	 */
@@ -161,6 +201,9 @@ struct vc4_dev {
 	} hangcheck;
 
 	struct semaphore async_modeset;
+
+	struct drm_modeset_lock ctm_state_lock;
+	struct drm_private_obj ctm_manager;
 };
 
 static inline struct vc4_dev *
@@ -360,6 +403,39 @@ to_vc4_encoder(struct drm_encoder *encoder)
 	return container_of(encoder, struct vc4_encoder, base);
 }
 
+struct vc4_crtc_data {
+	/* Which channel of the HVS this pixelvalve sources from. */
+	int hvs_channel;
+
+	enum vc4_encoder_type encoder_types[4];
+};
+
+struct vc4_crtc {
+	struct drm_crtc base;
+	const struct vc4_crtc_data *data;
+	void __iomem *regs;
+
+	/* Timestamp at start of vblank irq - unaffected by lock delays. */
+	ktime_t t_vblank;
+
+	/* Which HVS channel we're using for our CRTC. */
+	int channel;
+
+	u8 lut_r[256];
+	u8 lut_g[256];
+	u8 lut_b[256];
+	/* Size in pixels of the COB memory allocated to this CRTC. */
+	u32 cob_size;
+
+	struct drm_pending_vblank_event *event;
+};
+
+static inline struct vc4_crtc *
+to_vc4_crtc(struct drm_crtc *crtc)
+{
+	return (struct vc4_crtc *)crtc;
+}
+
 #define V3D_READ(offset) readl(vc4->v3d->regs + offset)
 #define V3D_WRITE(offset, val) writel(val, vc4->v3d->regs + offset)
 #define HVS_READ(offset) readl(vc4->hvs->regs + offset)
@@ -471,6 +547,21 @@ struct vc4_exec_info {
 	void *uniforms_v;
 	uint32_t uniforms_p;
 	uint32_t uniforms_size;
+
+	/* Pointer to a performance monitor object if the user requested it,
+	 * NULL otherwise.
+	 */
+	struct vc4_perfmon *perfmon;
+};
+
+/* Per-open file private data. Any driver-specific resource that has to be
+ * released when the DRM file is closed should be placed here.
+ */
+struct vc4_file {
+	struct {
+		struct idr idr;
+		struct mutex lock;
+	} perfmon;
 };
 
 static inline struct vc4_exec_info *
@@ -589,7 +680,7 @@ int vc4_get_hang_state_ioctl(struct drm_device *dev, void *data,
 			     struct drm_file *file_priv);
 int vc4_label_bo_ioctl(struct drm_device *dev, void *data,
 		       struct drm_file *file_priv);
-int vc4_fault(struct vm_fault *vmf);
+vm_fault_t vc4_fault(struct vm_fault *vmf);
 int vc4_mmap(struct file *filp, struct vm_area_struct *vma);
 struct reservation_object *vc4_prime_res_obj(struct drm_gem_object *obj);
 int vc4_prime_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma);
@@ -612,6 +703,11 @@ bool vc4_crtc_get_scanoutpos(struct drm_device *dev, unsigned int crtc_id,
 			     bool in_vblank_irq, int *vpos, int *hpos,
 			     ktime_t *stime, ktime_t *etime,
 			     const struct drm_display_mode *mode);
+void vc4_crtc_handle_vblank(struct vc4_crtc *crtc);
+void vc4_crtc_txp_armed(struct drm_crtc_state *state);
+void vc4_crtc_get_margins(struct drm_crtc_state *state,
+			  unsigned int *right, unsigned int *left,
+			  unsigned int *top, unsigned int *bottom);
 
 /* vc4_debugfs.c */
 int vc4_debugfs_init(struct drm_minor *minor);
@@ -632,7 +728,6 @@ extern const struct dma_fence_ops vc4_fence_ops;
 
 /* vc4_firmware_kms.c */
 extern struct platform_driver vc4_firmware_kms_driver;
-void vc4_fkms_cancel_page_flip(struct drm_crtc *crtc, struct drm_file *file);
 
 /* vc4_gem.c */
 void vc4_gem_init(struct drm_device *dev);
@@ -662,6 +757,10 @@ int vc4_hdmi_debugfs_regs(struct seq_file *m, void *unused);
 /* vc4_vec.c */
 extern struct platform_driver vc4_vec_driver;
 int vc4_vec_debugfs_regs(struct seq_file *m, void *unused);
+
+/* vc4_txp.c */
+extern struct platform_driver vc4_txp_driver;
+int vc4_txp_debugfs_regs(struct seq_file *m, void *unused);
 
 /* vc4_irq.c */
 irqreturn_t vc4_irq(int irq, void *arg);
@@ -715,3 +814,19 @@ bool vc4_check_tex_size(struct vc4_exec_info *exec,
 /* vc4_validate_shader.c */
 struct vc4_validated_shader_info *
 vc4_validate_shader(struct drm_gem_cma_object *shader_obj);
+
+/* vc4_perfmon.c */
+void vc4_perfmon_get(struct vc4_perfmon *perfmon);
+void vc4_perfmon_put(struct vc4_perfmon *perfmon);
+void vc4_perfmon_start(struct vc4_dev *vc4, struct vc4_perfmon *perfmon);
+void vc4_perfmon_stop(struct vc4_dev *vc4, struct vc4_perfmon *perfmon,
+		      bool capture);
+struct vc4_perfmon *vc4_perfmon_find(struct vc4_file *vc4file, int id);
+void vc4_perfmon_open_file(struct vc4_file *vc4file);
+void vc4_perfmon_close_file(struct vc4_file *vc4file);
+int vc4_perfmon_create_ioctl(struct drm_device *dev, void *data,
+			     struct drm_file *file_priv);
+int vc4_perfmon_destroy_ioctl(struct drm_device *dev, void *data,
+			      struct drm_file *file_priv);
+int vc4_perfmon_get_values_ioctl(struct drm_device *dev, void *data,
+				 struct drm_file *file_priv);

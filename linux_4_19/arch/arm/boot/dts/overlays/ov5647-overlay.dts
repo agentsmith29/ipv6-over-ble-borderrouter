@@ -1,9 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Definitions for OV5647 camera module on VC I2C bus
 /dts-v1/;
 /plugin/;
 
 /{
-	compatible = "brcm,bcm2708";
+	compatible = "brcm,bcm2835";
 
 	fragment@0 {
 		target = <&i2c_vc>;
@@ -13,7 +14,7 @@
 			status = "okay";
 
 			ov5647: ov5647@36 {
-				compatible = "ov5647";
+				compatible = "ovti,ov5647";
 				reg = <0x36>;
 				status = "okay";
 
@@ -68,13 +69,20 @@
 		};
 	};
 	fragment@4 {
+		target = <&i2c0_pins>;
+		__dormant__ {
+			brcm,pins = <0 1>;
+			brcm,function = <4>; /* alt0 */
+		};
+	};
+	fragment@5 {
 		target = <&i2c_vc>;
 		__overlay__ {
 			status = "okay";
 		};
 	};
 
-	fragment@5 {
+	fragment@6 {
 		target-path="/__overrides__";
 		__overlay__ {
 			cam0-pwdn-ctrl = <&ov5647>,"pwdn-gpios:0";
@@ -85,6 +93,7 @@
 	};
 
 	__overrides__ {
-		i2c_pins_28_29 = <0>,"+4-5";
+		i2c_pins_0_1 = <0>,"-2-3+4";
+		i2c_pins_28_29 = <0>,"+2-3-4";
 	};
 };

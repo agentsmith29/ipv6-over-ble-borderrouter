@@ -256,7 +256,7 @@ static int da9063_rtc_read_time(struct device *dev, struct rtc_time *tm)
 	else
 		rtc->rtc_sync = false;
 
-	return rtc_valid_tm(tm);
+	return 0;
 }
 
 static int da9063_rtc_set_time(struct device *dev, struct rtc_time *tm)
@@ -479,6 +479,13 @@ static int da9063_rtc_probe(struct platform_device *pdev)
 
 	da9063_data_to_tm(data, &rtc->alarm_time, rtc);
 	rtc->rtc_sync = false;
+
+	/*
+	 * TODO: some models have alarms on a minute boundary but still support
+	 * real hardware interrupts. Add this once the core supports it.
+	 */
+	if (config->rtc_data_start != RTC_SEC)
+		rtc->rtc_dev->uie_unsupported = 1;
 
 	irq_alarm = platform_get_irq_byname(pdev, "ALARM");
 	ret = devm_request_threaded_irq(&pdev->dev, irq_alarm, NULL,

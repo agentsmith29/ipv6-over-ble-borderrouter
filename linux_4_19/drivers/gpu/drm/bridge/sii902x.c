@@ -170,7 +170,7 @@ static int sii902x_get_modes(struct drm_connector *connector)
 		return ret;
 
 	edid = drm_get_edid(connector, sii902x->i2c->adapter);
-	drm_mode_connector_update_edid_property(connector, edid);
+	drm_connector_update_edid_property(connector, edid);
 	if (edid) {
 		num = drm_add_edid_modes(connector, edid);
 		kfree(edid);
@@ -261,10 +261,11 @@ static void sii902x_bridge_mode_set(struct drm_bridge *bridge,
 	struct regmap *regmap = sii902x->regmap;
 	u8 buf[HDMI_INFOFRAME_SIZE(AVI)];
 	struct hdmi_avi_infoframe frame;
+	u16 pixel_clock_10kHz = adj->clock / 10;
 	int ret;
 
-	buf[0] = adj->clock;
-	buf[1] = adj->clock >> 8;
+	buf[0] = pixel_clock_10kHz & 0xff;
+	buf[1] = pixel_clock_10kHz >> 8;
 	buf[2] = adj->vrefresh;
 	buf[3] = 0x00;
 	buf[4] = adj->hdisplay;
@@ -324,7 +325,7 @@ static int sii902x_bridge_attach(struct drm_bridge *bridge)
 	else
 		sii902x->connector.polled = DRM_CONNECTOR_POLL_CONNECT;
 
-	drm_mode_connector_attach_encoder(&sii902x->connector, bridge->encoder);
+	drm_connector_attach_encoder(&sii902x->connector, bridge->encoder);
 
 	return 0;
 }

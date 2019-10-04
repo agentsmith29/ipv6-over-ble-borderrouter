@@ -38,6 +38,7 @@
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
 #include <linux/of_dma.h>
+#include <linux/swiotlb.h>
 
 #include "sdhci.h"
 
@@ -251,7 +252,7 @@ static void bcm2835_mmc_dumpregs(struct bcm2835_host *host)
 		bcm2835_mmc_readl(host, SDHCI_INT_ENABLE),
 		bcm2835_mmc_readl(host, SDHCI_SIGNAL_ENABLE));
 	pr_debug(DRIVER_NAME ": AC12 err: 0x%08x | Slot int: 0x%08x\n",
-		bcm2835_mmc_readw(host, SDHCI_ACMD12_ERR),
+		bcm2835_mmc_readw(host, SDHCI_AUTO_CMD_STATUS),
 		bcm2835_mmc_readw(host, SDHCI_SLOT_INT_STATUS));
 	pr_debug(DRIVER_NAME ": Caps:     0x%08x | Caps_1:   0x%08x\n",
 		bcm2835_mmc_readl(host, SDHCI_CAPABILITIES),
@@ -344,16 +345,17 @@ static void bcm2835_mmc_dma_complete(void *param)
 
 	host->use_dma = false;
 
-	if (host->data && !(host->data->flags & MMC_DATA_WRITE)) {
-		/* otherwise handled in SDHCI IRQ */
+	if (host->data) {
 		dma_chan = host->dma_chan_rxtx;
-		dir_data = DMA_FROM_DEVICE;
-
+		if (host->data->flags & MMC_DATA_WRITE)
+			dir_data = DMA_TO_DEVICE;
+		else
+			dir_data = DMA_FROM_DEVICE;
 		dma_unmap_sg(dma_chan->device->dev,
 		     host->data->sg, host->data->sg_len,
 		     dir_data);
-
-		bcm2835_mmc_finish_data(host);
+		if (! (host->data->flags & MMC_DATA_WRITE))
+			bcm2835_mmc_finish_data(host);
 	} else if (host->wait_for_dma) {
 		host->wait_for_dma = false;
 		tasklet_schedule(&host->finish_tasklet);
@@ -539,6 +541,8 @@ static void bcm2835_mmc_transfer_dma(struct bcm2835_host *host)
 		spin_unlock_irqrestore(&host->lock, flags);
 		dmaengine_submit(desc);
 		dma_async_issue_pending(dma_chan);
+	} else {
+		dma_unmap_sg(dma_chan->device->dev, host->data->sg, len, dir_data);
 	}
 
 }
@@ -820,12 +824,10 @@ static void bcm2835_mmc_finish_command(struct bcm2835_host *host)
 }
 
 
-static void bcm2835_mmc_timeout_timer(unsigned long data)
+static void bcm2835_mmc_timeout_timer(struct timer_list *t)
 {
-	struct bcm2835_host *host;
+	struct bcm2835_host *host = from_timer(host, t, timer);
 	unsigned long flags;
-
-	host = (struct bcm2835_host *)data;
 
 	spin_lock_irqsave(&host->lock, flags);
 
@@ -1376,7 +1378,10 @@ static int bcm2835_mmc_add_host(struct bcm2835_host *host)
 	}
 #endif
 	mmc->max_segs = 128;
-	mmc->max_req_size = 524288;
+	if (swiotlb_max_segment())
+		mmc->max_req_size = (1 << IO_TLB_SHIFT) * IO_TLB_SEGSIZE;
+	else
+		mmc->max_req_size = 524288;
 	mmc->max_seg_size = mmc->max_req_size;
 	mmc->max_blk_size = 512;
 	mmc->max_blk_count =  65535;
@@ -1387,23 +1392,29 @@ static int bcm2835_mmc_add_host(struct bcm2835_host *host)
 	tasklet_init(&host->finish_tasklet,
 		bcm2835_mmc_tasklet_finish, (unsigned long)host);
 
-	setup_timer(&host->timer, bcm2835_mmc_timeout_timer, (unsigned long)host);
+	timer_setup(&host->timer, bcm2835_mmc_timeout_timer, 0);
 	init_waitqueue_head(&host->buf_ready_int);
 
 	bcm2835_mmc_init(host, 0);
-	ret = devm_request_threaded_irq(dev, host->irq, bcm2835_mmc_irq,
-					bcm2835_mmc_thread_irq, IRQF_SHARED,
-					mmc_hostname(mmc), host);
+	ret = request_threaded_irq(host->irq, bcm2835_mmc_irq,
+				   bcm2835_mmc_thread_irq, IRQF_SHARED,
+				   mmc_hostname(mmc), host);
 	if (ret) {
 		dev_err(dev, "Failed to request IRQ %d: %d\n", host->irq, ret);
 		goto untasklet;
 	}
 
 	mmiowb();
-	mmc_add_host(mmc);
+	ret = mmc_add_host(mmc);
+	if (ret) {
+		dev_err(dev, "could not add MMC host\n");
+		goto free_irq;
+	}
 
 	return 0;
 
+free_irq:
+	free_irq(host->irq, host);
 untasklet:
 	tasklet_kill(&host->finish_tasklet);
 
@@ -1441,7 +1452,8 @@ static int bcm2835_mmc_probe(struct platform_device *pdev)
 	addr = of_get_address(node, 0, NULL, NULL);
 	if (!addr) {
 		dev_err(dev, "could not get DMA-register address\n");
-		return -ENODEV;
+		ret = -ENODEV;
+		goto err;
 	}
 	host->bus_addr = be32_to_cpup(addr);
 	pr_debug(" - ioaddr %lx, iomem->start %lx, bus_addr %lx\n",
@@ -1505,6 +1517,8 @@ static int bcm2835_mmc_probe(struct platform_device *pdev)
 
 	return 0;
 err:
+	if (host->dma_chan_rxtx)
+		dma_release_channel(host->dma_chan_rxtx);
 	mmc_free_host(mmc);
 
 	return ret;
@@ -1550,8 +1564,10 @@ static int bcm2835_mmc_remove(struct platform_device *pdev)
 
 	tasklet_kill(&host->finish_tasklet);
 
+	if (host->dma_chan_rxtx)
+		dma_release_channel(host->dma_chan_rxtx);
+
 	mmc_free_host(host->mmc);
-	platform_set_drvdata(pdev, NULL);
 
 	return 0;
 }

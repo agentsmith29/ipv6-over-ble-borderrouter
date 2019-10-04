@@ -342,7 +342,7 @@ out:
 	return retval;
 }
 
-static unsigned int hpet_poll(struct file *file, poll_table * wait)
+static __poll_t hpet_poll(struct file *file, poll_table * wait)
 {
 	unsigned long v;
 	struct hpet_dev *devp;
@@ -359,7 +359,7 @@ static unsigned int hpet_poll(struct file *file, poll_table * wait)
 	spin_unlock_irq(&hpet_lock);
 
 	if (v != 0)
-		return POLLIN | POLLRDNORM;
+		return EPOLLIN | EPOLLRDNORM;
 
 	return 0;
 }
@@ -377,7 +377,7 @@ static __init int hpet_mmap_enable(char *str)
 	pr_info("HPET mmap %s\n", hpet_mmap_enabled ? "enabled" : "disabled");
 	return 1;
 }
-__setup("hpet_mmap", hpet_mmap_enable);
+__setup("hpet_mmap=", hpet_mmap_enable);
 
 static int hpet_mmap(struct file *file, struct vm_area_struct *vma)
 {
@@ -570,8 +570,7 @@ static inline unsigned long hpet_time_div(struct hpets *hpets,
 	unsigned long long m;
 
 	m = hpets->hp_tick_freq + (dis >> 1);
-	do_div(m, dis);
-	return (unsigned long)m;
+	return div64_ul(m, dis);
 }
 
 static int
@@ -579,7 +578,6 @@ hpet_ioctl_common(struct hpet_dev *devp, unsigned int cmd, unsigned long arg,
 		  struct hpet_info *info)
 {
 	struct hpet_timer __iomem *timer;
-	struct hpet __iomem *hpet;
 	struct hpets *hpetp;
 	int err;
 	unsigned long v;
@@ -591,7 +589,6 @@ hpet_ioctl_common(struct hpet_dev *devp, unsigned int cmd, unsigned long arg,
 	case HPET_DPI:
 	case HPET_IRQFREQ:
 		timer = devp->hd_timer;
-		hpet = devp->hd_hpet;
 		hpetp = devp->hd_hpets;
 		break;
 	case HPET_IE_ON:

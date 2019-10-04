@@ -518,11 +518,11 @@ exit:
 
 /* LED trigger */
 static int tx_activity;
-static void at76_ledtrig_tx_timerfunc(unsigned long data);
-static DEFINE_TIMER(ledtrig_tx_timer, at76_ledtrig_tx_timerfunc, 0, 0);
+static void at76_ledtrig_tx_timerfunc(struct timer_list *unused);
+static DEFINE_TIMER(ledtrig_tx_timer, at76_ledtrig_tx_timerfunc);
 DEFINE_LED_TRIGGER(ledtrig_tx);
 
-static void at76_ledtrig_tx_timerfunc(unsigned long data)
+static void at76_ledtrig_tx_timerfunc(struct timer_list *unused)
 {
 	static int tx_lastactivity;
 
@@ -2585,8 +2585,8 @@ static int __init at76_mod_init(void)
 	if (result < 0)
 		printk(KERN_ERR DRIVER_NAME
 		       ": usb_register failed (status %d)\n", result);
-
-	led_trigger_register_simple("at76_usb-tx", &ledtrig_tx);
+	else
+		led_trigger_register_simple("at76_usb-tx", &ledtrig_tx);
 	return result;
 }
 

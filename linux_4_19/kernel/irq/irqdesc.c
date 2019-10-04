@@ -1,10 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) 1992, 1998-2006 Linus Torvalds, Ingo Molnar
  * Copyright (C) 2005-2006, Thomas Gleixner, Russell King
  *
- * This file contains the interrupt descriptor management code
- *
- * Detailed information is available in Documentation/core-api/genericirq.rst
+ * This file contains the interrupt descriptor management code. Detailed
+ * information is available in Documentation/core-api/genericirq.rst
  *
  */
 #include <linux/irq.h>
@@ -119,6 +119,7 @@ static void desc_set_defaults(unsigned int irq, struct irq_desc *desc, int node,
 	desc->depth = 1;
 	desc->irq_count = 0;
 	desc->irqs_unhandled = 0;
+	desc->tot_count = 0;
 	desc->name = NULL;
 	desc->owner = owner;
 	for_each_possible_cpu(cpu)
@@ -210,6 +211,22 @@ static ssize_t type_show(struct kobject *kobj,
 }
 IRQ_ATTR_RO(type);
 
+static ssize_t wakeup_show(struct kobject *kobj,
+			   struct kobj_attribute *attr, char *buf)
+{
+	struct irq_desc *desc = container_of(kobj, struct irq_desc, kobj);
+	ssize_t ret = 0;
+
+	raw_spin_lock_irq(&desc->lock);
+	ret = sprintf(buf, "%s\n",
+		      irqd_is_wakeup_set(&desc->irq_data) ? "enabled" : "disabled");
+	raw_spin_unlock_irq(&desc->lock);
+
+	return ret;
+
+}
+IRQ_ATTR_RO(wakeup);
+
 static ssize_t name_show(struct kobject *kobj,
 			 struct kobj_attribute *attr, char *buf)
 {
@@ -253,6 +270,7 @@ static struct attribute *irq_attrs[] = {
 	&chip_name_attr.attr,
 	&hwirq_attr.attr,
 	&type_attr.attr,
+	&wakeup_attr.attr,
 	&name_attr.attr,
 	&actions_attr.attr,
 	NULL
@@ -274,6 +292,18 @@ static void irq_sysfs_add(int irq, struct irq_desc *desc)
 		if (kobject_add(&desc->kobj, irq_kobj_base, "%d", irq))
 			pr_warn("Failed to add kobject for irq %d\n", irq);
 	}
+}
+
+static void irq_sysfs_del(struct irq_desc *desc)
+{
+	/*
+	 * If irq_sysfs_init() has not yet been invoked (early boot), then
+	 * irq_kobj_base is NULL and the descriptor was never added.
+	 * kobject_del() complains about a object with no parent, so make
+	 * it conditional.
+	 */
+	if (irq_kobj_base)
+		kobject_del(&desc->kobj);
 }
 
 static int __init irq_sysfs_init(void)
@@ -306,6 +336,7 @@ static struct kobj_type irq_kobj_type = {
 };
 
 static void irq_sysfs_add(int irq, struct irq_desc *desc) {}
+static void irq_sysfs_del(struct irq_desc *desc) {}
 
 #endif /* CONFIG_SYSFS */
 
@@ -419,13 +450,14 @@ static void free_desc(unsigned int irq)
 	 * The sysfs entry must be serialized against a concurrent
 	 * irq_sysfs_init() as well.
 	 */
-	kobject_del(&desc->kobj);
+	irq_sysfs_del(desc);
 	delete_irq_desc(irq);
 
 	/*
 	 * We free the descriptor, masks and stat fields via RCU. That
 	 * allows demultiplex interrupts to do rcu based management of
 	 * the child interrupts.
+	 * This also allows us to use rcu in kstat_irqs_usr().
 	 */
 	call_rcu(&desc->rcu, delayed_free_desc);
 }
@@ -446,7 +478,7 @@ static int alloc_descs(unsigned int start, unsigned int cnt, int node,
 		}
 	}
 
-	flags = affinity ? IRQD_AFFINITY_MANAGED : 0;
+	flags = affinity ? IRQD_AFFINITY_MANAGED | IRQD_MANAGED_SHUTDOWN : 0;
 	mask = NULL;
 
 	for (i = 0; i < cnt; i++) {
@@ -460,6 +492,7 @@ static int alloc_descs(unsigned int start, unsigned int cnt, int node,
 			goto err;
 		irq_insert_desc(start + i, desc);
 		irq_sysfs_add(start + i, desc);
+		irq_add_debugfs_entry(start + i, desc);
 	}
 	bitmap_set(allocated_irqs, start, cnt);
 	return start;
@@ -534,6 +567,7 @@ int __init early_irq_init(void)
 		alloc_masks(&desc[i], node);
 		raw_spin_lock_init(&desc[i].lock);
 		lockdep_set_class(&desc[i].lock, &irq_desc_lock_class);
+		mutex_init(&desc[i].request_mutex);
 		desc_set_defaults(i, &desc[i], node, NULL, NULL);
 	}
 	return arch_early_irq_init();
@@ -861,6 +895,7 @@ int irq_get_percpu_devid_partition(unsigned int irq, struct cpumask *affinity)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(irq_get_percpu_devid_partition);
 
 void kstat_incr_irq_this_cpu(unsigned int irq)
 {
@@ -895,11 +930,15 @@ unsigned int kstat_irqs_cpu(unsigned int irq, int cpu)
 unsigned int kstat_irqs(unsigned int irq)
 {
 	struct irq_desc *desc = irq_to_desc(irq);
-	int cpu;
 	unsigned int sum = 0;
+	int cpu;
 
 	if (!desc || !desc->kstat_irqs)
 		return 0;
+	if (!irq_settings_is_per_cpu_devid(desc) &&
+	    !irq_settings_is_per_cpu(desc))
+	    return desc->tot_count;
+
 	for_each_possible_cpu(cpu)
 		sum += *per_cpu_ptr(desc->kstat_irqs, cpu);
 	return sum;
@@ -909,17 +948,17 @@ unsigned int kstat_irqs(unsigned int irq)
  * kstat_irqs_usr - Get the statistics for an interrupt
  * @irq:	The interrupt number
  *
- * Returns the sum of interrupt counts on all cpus since boot for
- * @irq. Contrary to kstat_irqs() this can be called from any
- * preemptible context. It's protected against concurrent removal of
- * an interrupt descriptor when sparse irqs are enabled.
+ * Returns the sum of interrupt counts on all cpus since boot for @irq.
+ * Contrary to kstat_irqs() this can be called from any context.
+ * It uses rcu since a concurrent removal of an interrupt descriptor is
+ * observing an rcu grace period before delayed_free_desc()/irq_kobj_release().
  */
 unsigned int kstat_irqs_usr(unsigned int irq)
 {
 	unsigned int sum;
 
-	irq_lock_sparse();
+	rcu_read_lock();
 	sum = kstat_irqs(irq);
-	irq_unlock_sparse();
+	rcu_read_unlock();
 	return sum;
 }

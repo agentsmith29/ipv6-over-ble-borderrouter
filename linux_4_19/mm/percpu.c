@@ -170,6 +170,14 @@ static LIST_HEAD(pcpu_map_extend_chunks);
 int pcpu_nr_empty_pop_pages;
 
 /*
+ * The number of populated pages in use by the allocator, protected by
+ * pcpu_lock.  This number is kept per a unit per chunk (i.e. when a page gets
+ * allocated/deallocated, it is allocated/deallocated in all units of a chunk
+ * and increments/decrements this count by 1).
+ */
+static unsigned long pcpu_nr_populated;
+
+/*
  * Balance work is used to populate or destroy chunks asynchronously.  We
  * try to keep the number of populated free pages between
  * PCPU_EMPTY_POP_PAGES_LOW and HIGH for atomic allocations and at most one
@@ -455,9 +463,6 @@ static void pcpu_next_fit_region(struct pcpu_chunk *chunk, int alloc_bits,
  * This is to facilitate passing through whitelisted flags.  The
  * returned memory is always zeroed.
  *
- * CONTEXT:
- * Does GFP_KERNEL allocation.
- *
  * RETURNS:
  * Pointer to the allocated area on success, NULL on failure.
  */
@@ -467,10 +472,9 @@ static void *pcpu_mem_zalloc(size_t size, gfp_t gfp)
 		return NULL;
 
 	if (size <= PAGE_SIZE)
-		return kzalloc(size, gfp | GFP_KERNEL);
+		return kzalloc(size, gfp);
 	else
-		return __vmalloc(size, gfp | GFP_KERNEL | __GFP_ZERO,
-				 PAGE_KERNEL);
+		return __vmalloc(size, gfp | __GFP_ZERO, PAGE_KERNEL);
 }
 
 /**
@@ -984,7 +988,8 @@ static int pcpu_alloc_area(struct pcpu_chunk *chunk, int alloc_bits,
 	/*
 	 * Search to find a fit.
 	 */
-	end = start + alloc_bits + PCPU_BITMAP_BLOCK_BITS;
+	end = min_t(int, start + alloc_bits + PCPU_BITMAP_BLOCK_BITS,
+		    pcpu_chunk_map_bits(chunk));
 	bit_off = bitmap_find_next_zero_area(chunk->alloc_map, end, start,
 					     alloc_bits, align_mask);
 	if (bit_off >= end)
@@ -1237,6 +1242,7 @@ static void pcpu_chunk_populated(struct pcpu_chunk *chunk, int page_start,
 
 	bitmap_set(chunk->populated, page_start, nr);
 	chunk->nr_populated += nr;
+	pcpu_nr_populated += nr;
 
 	if (!for_alloc) {
 		chunk->nr_empty_pop_pages += nr;
@@ -1265,6 +1271,7 @@ static void pcpu_chunk_depopulated(struct pcpu_chunk *chunk,
 	chunk->nr_populated -= nr;
 	chunk->nr_empty_pop_pages -= nr;
 	pcpu_nr_empty_pop_pages -= nr;
+	pcpu_nr_populated -= nr;
 }
 
 /*
@@ -1282,9 +1289,10 @@ static void pcpu_chunk_depopulated(struct pcpu_chunk *chunk,
  * pcpu_addr_to_page		- translate address to physical address
  * pcpu_verify_alloc_info	- check alloc_info is acceptable during init
  */
-static int pcpu_populate_chunk(struct pcpu_chunk *chunk, int off, int size,
-			       gfp_t gfp);
-static void pcpu_depopulate_chunk(struct pcpu_chunk *chunk, int off, int size);
+static int pcpu_populate_chunk(struct pcpu_chunk *chunk,
+			       int page_start, int page_end, gfp_t gfp);
+static void pcpu_depopulate_chunk(struct pcpu_chunk *chunk,
+				  int page_start, int page_end);
 static struct pcpu_chunk *pcpu_create_chunk(gfp_t gfp);
 static void pcpu_destroy_chunk(struct pcpu_chunk *chunk);
 static struct page *pcpu_addr_to_page(void *addr);
@@ -1345,6 +1353,8 @@ static struct pcpu_chunk *pcpu_chunk_addr_search(void *addr)
 static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
 				 gfp_t gfp)
 {
+	/* whitelisted flags that can be passed to the backing allocators */
+	gfp_t pcpu_gfp = gfp & (GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN);
 	bool is_atomic = (gfp & GFP_KERNEL) != GFP_KERNEL;
 	bool do_warn = !(gfp & __GFP_NOWARN);
 	static int warn_limit = 10;
@@ -1375,8 +1385,17 @@ static void __percpu *pcpu_alloc(size_t size, size_t align, bool reserved,
 		return NULL;
 	}
 
-	if (!is_atomic)
-		mutex_lock(&pcpu_alloc_mutex);
+	if (!is_atomic) {
+		/*
+		 * pcpu_balance_workfn() allocates memory under this mutex,
+		 * and it may wait for memory reclaim. Allow current task
+		 * to become OOM victim, in case of memory pressure.
+		 */
+		if (gfp & __GFP_NOFAIL)
+			mutex_lock(&pcpu_alloc_mutex);
+		else if (mutex_lock_killable(&pcpu_alloc_mutex))
+			return NULL;
+	}
 
 	spin_lock_irqsave(&pcpu_lock, flags);
 
@@ -1427,7 +1446,7 @@ restart:
 	}
 
 	if (list_empty(&pcpu_slot[pcpu_nr_slots - 1])) {
-		chunk = pcpu_create_chunk(0);
+		chunk = pcpu_create_chunk(pcpu_gfp);
 		if (!chunk) {
 			err = "failed to allocate new chunk";
 			goto fail;
@@ -1456,7 +1475,7 @@ area_found:
 					   page_start, page_end) {
 			WARN_ON(chunk->immutable);
 
-			ret = pcpu_populate_chunk(chunk, rs, re, 0);
+			ret = pcpu_populate_chunk(chunk, rs, re, pcpu_gfp);
 
 			spin_lock_irqsave(&pcpu_lock, flags);
 			if (ret) {
@@ -1577,7 +1596,7 @@ void __percpu *__alloc_reserved_percpu(size_t size, size_t align)
 static void pcpu_balance_workfn(struct work_struct *work)
 {
 	/* gfp flags passed to underlying allocators */
-	const gfp_t gfp = __GFP_NORETRY | __GFP_NOWARN;
+	const gfp_t gfp = GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN;
 	LIST_HEAD(to_free);
 	struct list_head *free_head = &pcpu_slot[pcpu_nr_slots - 1];
 	struct pcpu_chunk *chunk, *next;
@@ -1613,6 +1632,7 @@ static void pcpu_balance_workfn(struct work_struct *work)
 			spin_unlock_irq(&pcpu_lock);
 		}
 		pcpu_destroy_chunk(chunk);
+		cond_resched();
 	}
 
 	/*
@@ -1702,6 +1722,7 @@ void free_percpu(void __percpu *ptr)
 	struct pcpu_chunk *chunk;
 	unsigned long flags;
 	int off;
+	bool need_balance = false;
 
 	if (!ptr)
 		return;
@@ -1723,7 +1744,7 @@ void free_percpu(void __percpu *ptr)
 
 		list_for_each_entry(pos, &pcpu_slot[pcpu_nr_slots - 1], list)
 			if (pos != chunk) {
-				pcpu_schedule_balance_work();
+				need_balance = true;
 				break;
 			}
 	}
@@ -1731,6 +1752,9 @@ void free_percpu(void __percpu *ptr)
 	trace_percpu_free_percpu(chunk->base_addr, off, ptr);
 
 	spin_unlock_irqrestore(&pcpu_lock, flags);
+
+	if (need_balance)
+		pcpu_schedule_balance_work();
 }
 EXPORT_SYMBOL_GPL(free_percpu);
 
@@ -1869,7 +1893,7 @@ struct pcpu_alloc_info * __init pcpu_alloc_alloc_info(int nr_groups,
 			  __alignof__(ai->groups[0].cpu_map[0]));
 	ai_size = base_size + nr_units * sizeof(ai->groups[0].cpu_map[0]);
 
-	ptr = memblock_virt_alloc_nopanic(PFN_ALIGN(ai_size), 0);
+	ptr = memblock_virt_alloc_nopanic(PFN_ALIGN(ai_size), PAGE_SIZE);
 	if (!ptr)
 		return NULL;
 	ai = ptr;
@@ -2167,6 +2191,9 @@ int __init pcpu_setup_first_chunk(const struct pcpu_alloc_info *ai,
 	pcpu_first_chunk = chunk;
 	pcpu_nr_empty_pop_pages = pcpu_first_chunk->nr_empty_pop_pages;
 	pcpu_chunk_relocate(pcpu_first_chunk, -1);
+
+	/* include all regions of the first chunk */
+	pcpu_nr_populated += PFN_DOWN(size_sum);
 
 	pcpu_stats_chunk_alloc();
 	trace_percpu_create_chunk(base_addr);
@@ -2507,8 +2534,8 @@ int __init pcpu_embed_first_chunk(size_t reserved_size, size_t dyn_size,
 		ai->groups[group].base_offset = areas[group] - base;
 	}
 
-	pr_info("Embedded %zu pages/cpu @%p s%zu r%zu d%zu u%zu\n",
-		PFN_DOWN(size_sum), base, ai->static_size, ai->reserved_size,
+	pr_info("Embedded %zu pages/cpu s%zu r%zu d%zu u%zu\n",
+		PFN_DOWN(size_sum), ai->static_size, ai->reserved_size,
 		ai->dyn_size, ai->unit_size);
 
 	rc = pcpu_setup_first_chunk(ai, base);
@@ -2629,8 +2656,8 @@ int __init pcpu_page_first_chunk(size_t reserved_size,
 	}
 
 	/* we're ready, commit */
-	pr_info("%d %s pages/cpu @%p s%zu r%zu d%zu\n",
-		unit_pages, psize_str, vm.addr, ai->static_size,
+	pr_info("%d %s pages/cpu s%zu r%zu d%zu\n",
+		unit_pages, psize_str, ai->static_size,
 		ai->reserved_size, ai->dyn_size);
 
 	rc = pcpu_setup_first_chunk(ai, vm.addr);
@@ -2732,9 +2759,26 @@ void __init setup_per_cpu_areas(void)
 
 	if (pcpu_setup_first_chunk(ai, fc) < 0)
 		panic("Failed to initialize percpu areas.");
+	pcpu_free_alloc_info(ai);
 }
 
 #endif	/* CONFIG_SMP */
+
+/*
+ * pcpu_nr_pages - calculate total number of populated backing pages
+ *
+ * This reflects the number of pages populated to back chunks.  Metadata is
+ * excluded in the number exposed in meminfo as the number of backing pages
+ * scales with the number of cpus and can quickly outweigh the memory used for
+ * metadata.  It also keeps this calculation nice and simple.
+ *
+ * RETURNS:
+ * Total number of populated backing pages in use by the allocator.
+ */
+unsigned long pcpu_nr_pages(void)
+{
+	return pcpu_nr_populated * pcpu_nr_units;
+}
 
 /*
  * Percpu allocator is initialized early during boot when neither slab or

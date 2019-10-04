@@ -189,6 +189,49 @@ size_t phy_speeds(unsigned int *speeds, size_t size,
 	return count;
 }
 
+/**
+ * phy_resolve_aneg_linkmode - resolve the advertisements into phy settings
+ * @phydev: The phy_device struct
+ *
+ * Resolve our and the link partner advertisements into their corresponding
+ * speed and duplex. If full duplex was negotiated, extract the pause mode
+ * from the link partner mask.
+ */
+void phy_resolve_aneg_linkmode(struct phy_device *phydev)
+{
+	u32 common = phydev->lp_advertising & phydev->advertising;
+
+	if (common & ADVERTISED_10000baseT_Full) {
+		phydev->speed = SPEED_10000;
+		phydev->duplex = DUPLEX_FULL;
+	} else if (common & ADVERTISED_1000baseT_Full) {
+		phydev->speed = SPEED_1000;
+		phydev->duplex = DUPLEX_FULL;
+	} else if (common & ADVERTISED_1000baseT_Half) {
+		phydev->speed = SPEED_1000;
+		phydev->duplex = DUPLEX_HALF;
+	} else if (common & ADVERTISED_100baseT_Full) {
+		phydev->speed = SPEED_100;
+		phydev->duplex = DUPLEX_FULL;
+	} else if (common & ADVERTISED_100baseT_Half) {
+		phydev->speed = SPEED_100;
+		phydev->duplex = DUPLEX_HALF;
+	} else if (common & ADVERTISED_10baseT_Full) {
+		phydev->speed = SPEED_10;
+		phydev->duplex = DUPLEX_FULL;
+	} else if (common & ADVERTISED_10baseT_Half) {
+		phydev->speed = SPEED_10;
+		phydev->duplex = DUPLEX_HALF;
+	}
+
+	if (phydev->duplex == DUPLEX_FULL) {
+		phydev->pause = !!(phydev->lp_advertising & ADVERTISED_Pause);
+		phydev->asym_pause = !!(phydev->lp_advertising &
+					ADVERTISED_Asym_Pause);
+	}
+}
+EXPORT_SYMBOL_GPL(phy_resolve_aneg_linkmode);
+
 static void mmd_phy_indirect(struct mii_bus *bus, int phy_addr, int devad,
 			     u16 regnum)
 {
@@ -289,22 +332,44 @@ EXPORT_SYMBOL(phy_write_mmd);
  * @set: bit mask of bits to set
  *
  * Unlocked helper function which allows a PHY register to be modified as
- * new register value = (old register value & mask) | set
+ * new register value = (old register value & ~mask) | set
  */
 int __phy_modify(struct phy_device *phydev, u32 regnum, u16 mask, u16 set)
 {
-	int ret, res;
+	int ret;
 
 	ret = __phy_read(phydev, regnum);
-	if (ret >= 0) {
-		res = __phy_write(phydev, regnum, (ret & ~mask) | set);
-		if (res < 0)
-			ret = res;
-	}
+	if (ret < 0)
+		return ret;
+
+	ret = __phy_write(phydev, regnum, (ret & ~mask) | set);
+
+	return ret < 0 ? ret : 0;
+}
+EXPORT_SYMBOL_GPL(__phy_modify);
+
+/**
+ * phy_modify - Convenience function for modifying a given PHY register
+ * @phydev: the phy_device struct
+ * @regnum: register number to write
+ * @mask: bit mask of bits to clear
+ * @set: new value of bits set in mask to write to @regnum
+ *
+ * NOTE: MUST NOT be called from interrupt context,
+ * because the bus read/write functions may wait for an interrupt
+ * to conclude the operation.
+ */
+int phy_modify(struct phy_device *phydev, u32 regnum, u16 mask, u16 set)
+{
+	int ret;
+
+	mutex_lock(&phydev->mdio.bus->mdio_lock);
+	ret = __phy_modify(phydev, regnum, mask, set);
+	mutex_unlock(&phydev->mdio.bus->mdio_lock);
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(__phy_modify);
+EXPORT_SYMBOL_GPL(phy_modify);
 
 static int __phy_read_page(struct phy_device *phydev)
 {

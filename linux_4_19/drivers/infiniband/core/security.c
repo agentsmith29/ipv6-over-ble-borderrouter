@@ -30,8 +30,6 @@
  * SOFTWARE.
  */
 
-#ifdef CONFIG_SECURITY_INFINIBAND
-
 #include <linux/security.h>
 #include <linux/completion.h>
 #include <linux/list.h>
@@ -653,12 +651,11 @@ int ib_security_modify_qp(struct ib_qp *qp,
 	}
 	return ret;
 }
-EXPORT_SYMBOL(ib_security_modify_qp);
 
-int ib_security_pkey_access(struct ib_device *dev,
-			    u8 port_num,
-			    u16 pkey_index,
-			    void *sec)
+static int ib_security_pkey_access(struct ib_device *dev,
+				   u8 port_num,
+				   u16 pkey_index,
+				   void *sec)
 {
 	u64 subnet_prefix;
 	u16 pkey;
@@ -678,7 +675,6 @@ int ib_security_pkey_access(struct ib_device *dev,
 
 	return security_ib_pkey_access(sec, subnet_prefix, pkey);
 }
-EXPORT_SYMBOL(ib_security_pkey_access);
 
 static int ib_mad_agent_security_change(struct notifier_block *nb,
 					unsigned long event,
@@ -715,16 +711,20 @@ int ib_mad_agent_security_setup(struct ib_mad_agent *agent,
 						agent->device->name,
 						agent->port_num);
 	if (ret)
-		return ret;
+		goto free_security;
 
 	agent->lsm_nb.notifier_call = ib_mad_agent_security_change;
 	ret = register_lsm_notifier(&agent->lsm_nb);
 	if (ret)
-		return ret;
+		goto free_security;
 
 	agent->smp_allowed = true;
 	agent->lsm_nb_reg = true;
 	return 0;
+
+free_security:
+	security_ib_free_security(agent->security);
+	return ret;
 }
 
 void ib_mad_agent_security_cleanup(struct ib_mad_agent *agent)
@@ -732,9 +732,10 @@ void ib_mad_agent_security_cleanup(struct ib_mad_agent *agent)
 	if (!rdma_protocol_ib(agent->device, agent->port_num))
 		return;
 
-	security_ib_free_security(agent->security);
 	if (agent->lsm_nb_reg)
 		unregister_lsm_notifier(&agent->lsm_nb);
+
+	security_ib_free_security(agent->security);
 }
 
 int ib_mad_enforce_security(struct ib_mad_agent_private *map, u16 pkey_index)
@@ -753,5 +754,3 @@ int ib_mad_enforce_security(struct ib_mad_agent_private *map, u16 pkey_index)
 				       pkey_index,
 				       map->agent.security);
 }
-
-#endif /* CONFIG_SECURITY_INFINIBAND */

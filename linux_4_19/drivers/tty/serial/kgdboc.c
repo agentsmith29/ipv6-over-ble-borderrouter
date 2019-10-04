@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Based on the same principle as kgdboe using the NETPOLL api, this
  * driver uses a console polling api to implement a gdb serial inteface
@@ -6,10 +7,6 @@
  * Maintainer: Jason Wessel <jason.wessel@windriver.com>
  *
  * 2007-2008 (c) Jason Wessel - Wind River Systems, Inc.
- *
- * This file is licensed under the terms of the GNU General Public
- * License version 2. This program is licensed "as is" without any
- * warranty of any kind, whether express or implied.
  */
 #include <linux/kernel.h>
 #include <linux/ctype.h>
@@ -148,8 +145,10 @@ static int configure_kgdboc(void)
 	char *cptr = config;
 	struct console *cons;
 
-	if (!strlen(config) || isspace(config[0]))
+	if (!strlen(config) || isspace(config[0])) {
+		err = 0;
 		goto noconfig;
+	}
 
 	kgdboc_io_ops.is_console = 0;
 	kgdb_tty_driver = NULL;
@@ -230,7 +229,8 @@ static void kgdboc_put_char(u8 chr)
 					kgdb_tty_line, chr);
 }
 
-static int param_set_kgdboc_var(const char *kmessage, struct kernel_param *kp)
+static int param_set_kgdboc_var(const char *kmessage,
+				const struct kernel_param *kp)
 {
 	size_t len = strlen(kmessage);
 

@@ -31,9 +31,10 @@
  * @delta is the difference between the current rtt sample and the
  * running average srtt. We add 1/8 of that to the srtt in order to
  * update the current srtt estimate. The variance estimate is a bit
- * more complicated. We subtract the abs value of the @delta from
- * the current variance estimate and add 1/4 of that to the running
- * total.
+ * more complicated. We subtract the current variance estimate from
+ * the abs value of the @delta and add 1/4 of that to the running
+ * total.  That's equivalent to 3/4 of the current variance
+ * estimate plus 1/4 of the abs of @delta.
  *
  * Note that the index points at the array entry containing the smoothed
  * mean value, and the variance is always in the following entry
@@ -49,7 +50,7 @@ static inline void gfs2_update_stats(struct gfs2_lkstats *s, unsigned index,
 	s64 delta = sample - s->stats[index];
 	s->stats[index] += (delta >> 3);
 	index++;
-	s->stats[index] += ((abs(delta) - s->stats[index]) >> 2);
+	s->stats[index] += (s64)(abs(delta) - s->stats[index]) >> 2;
 }
 
 /**
@@ -821,6 +822,13 @@ restart:
 		goto fail;
 	}
 
+	/**
+	 * If we're a spectator, we don't want to take the lock in EX because
+	 * we cannot do the first-mount responsibility it implies: recovery.
+	 */
+	if (sdp->sd_args.ar_spectator)
+		goto locks_done;
+
 	error = mounted_lock(sdp, DLM_LOCK_EX, DLM_LKF_CONVERT|DLM_LKF_NOQUEUE);
 	if (!error) {
 		mounted_mode = DLM_LOCK_EX;
@@ -896,9 +904,16 @@ locks_done:
 	if (lvb_gen < mount_gen) {
 		/* wait for mounted nodes to update control_lock lvb to our
 		   generation, which might include new recovery bits set */
-		fs_info(sdp, "control_mount wait1 block %u start %u mount %u "
-			"lvb %u flags %lx\n", block_gen, start_gen, mount_gen,
-			lvb_gen, ls->ls_recover_flags);
+		if (sdp->sd_args.ar_spectator) {
+			fs_info(sdp, "Recovery is required. Waiting for a "
+				"non-spectator to mount.\n");
+			msleep_interruptible(1000);
+		} else {
+			fs_info(sdp, "control_mount wait1 block %u start %u "
+				"mount %u lvb %u flags %lx\n", block_gen,
+				start_gen, mount_gen, lvb_gen,
+				ls->ls_recover_flags);
+		}
 		spin_unlock(&ls->ls_recover_spin);
 		goto restart;
 	}
@@ -1091,7 +1106,7 @@ static void gdlm_recover_slot(void *arg, struct dlm_slot *slot)
 
 	spin_lock(&ls->ls_recover_spin);
 	if (ls->ls_recover_size < jid + 1) {
-		fs_err(sdp, "recover_slot jid %d gen %u short size %d",
+		fs_err(sdp, "recover_slot jid %d gen %u short size %d\n",
 		       jid, ls->ls_recover_block, ls->ls_recover_size);
 		spin_unlock(&ls->ls_recover_spin);
 		return;
@@ -1153,7 +1168,7 @@ static void gdlm_recovery_result(struct gfs2_sbd *sdp, unsigned int jid,
 		return;
 	}
 	if (ls->ls_recover_size < jid + 1) {
-		fs_err(sdp, "recovery_result jid %d short size %d",
+		fs_err(sdp, "recovery_result jid %d short size %d\n",
 		       jid, ls->ls_recover_size);
 		spin_unlock(&ls->ls_recover_spin);
 		return;

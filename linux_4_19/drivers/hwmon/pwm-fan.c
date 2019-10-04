@@ -180,7 +180,7 @@ static int pwm_fan_of_get_cooling_data(struct device *dev,
 	}
 
 	num = ret;
-	ctx->pwm_fan_cooling_levels = devm_kzalloc(dev, num * sizeof(u32),
+	ctx->pwm_fan_cooling_levels = devm_kcalloc(dev, num, sizeof(u32),
 						   GFP_KERNEL);
 	if (!ctx->pwm_fan_cooling_levels)
 		return -ENOMEM;
@@ -250,7 +250,7 @@ static int pwm_fan_probe(struct platform_device *pdev)
 
 	ret = pwm_fan_of_get_cooling_data(&pdev->dev, ctx);
 	if (ret)
-		return ret;
+		goto err_pwm_disable;
 
 	ctx->pwm_fan_state = ctx->pwm_fan_max_state;
 	if (IS_ENABLED(CONFIG_THERMAL)) {

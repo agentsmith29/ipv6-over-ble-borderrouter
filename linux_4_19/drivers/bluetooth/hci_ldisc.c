@@ -195,7 +195,7 @@ restart:
 	clear_bit(HCI_UART_SENDING, &hu->tx_state);
 }
 
-static void hci_uart_init_work(struct work_struct *work)
+void hci_uart_init_work(struct work_struct *work)
 {
 	struct hci_uart *hu = container_of(work, struct hci_uart, init_ready);
 	int err;
@@ -207,11 +207,11 @@ static void hci_uart_init_work(struct work_struct *work)
 	err = hci_register_dev(hu->hdev);
 	if (err < 0) {
 		BT_ERR("Can't register HCI device");
+		clear_bit(HCI_UART_PROTO_READY, &hu->flags);
+		hu->proto->close(hu);
 		hdev = hu->hdev;
 		hu->hdev = NULL;
 		hci_free_dev(hdev);
-		clear_bit(HCI_UART_PROTO_READY, &hu->flags);
-		hu->proto->close(hu);
 		return;
 	}
 
@@ -229,15 +229,6 @@ int hci_uart_init_ready(struct hci_uart *hu)
 }
 
 /* ------- Interface to HCI layer ------ */
-/* Initialize device */
-static int hci_uart_open(struct hci_dev *hdev)
-{
-	BT_DBG("%s %p", hdev->name, hdev);
-
-	/* Nothing to do for UART driver */
-	return 0;
-}
-
 /* Reset device */
 static int hci_uart_flush(struct hci_dev *hdev)
 {
@@ -260,6 +251,17 @@ static int hci_uart_flush(struct hci_dev *hdev)
 		hu->proto->flush(hu);
 
 	percpu_up_read(&hu->proto_lock);
+
+	return 0;
+}
+
+/* Initialize device */
+static int hci_uart_open(struct hci_dev *hdev)
+{
+	BT_DBG("%s %p", hdev->name, hdev);
+
+	/* Undo clearing this from hci_uart_close() */
+	hdev->flush = hci_uart_flush;
 
 	return 0;
 }
@@ -295,6 +297,19 @@ static int hci_uart_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
 	hci_uart_tx_wakeup(hu);
 
 	return 0;
+}
+
+/* Check the underlying device or tty has flow control support */
+bool hci_uart_has_flow_control(struct hci_uart *hu)
+{
+	/* serdev nodes check if the needed operations are present */
+	if (hu->serdev)
+		return true;
+
+	if (hu->tty->driver->ops->tiocmget && hu->tty->driver->ops->tiocmset)
+		return true;
+
+	return false;
 }
 
 /* Flow control or un-flow control the device */
@@ -447,6 +462,8 @@ static int hci_uart_setup(struct hci_dev *hdev)
 		btbcm_check_bdaddr(hdev);
 		break;
 #endif
+	default:
+		break;
 	}
 
 done:
@@ -612,6 +629,7 @@ static void hci_uart_tty_receive(struct tty_struct *tty, const u8 *data,
 static int hci_uart_register_dev(struct hci_uart *hu)
 {
 	struct hci_dev *hdev;
+	int err;
 
 	BT_DBG("");
 
@@ -655,11 +673,22 @@ static int hci_uart_register_dev(struct hci_uart *hu)
 	else
 		hdev->dev_type = HCI_PRIMARY;
 
+	/* Only call open() for the protocol after hdev is fully initialized as
+	 * open() (or a timer/workqueue it starts) may attempt to reference it.
+	 */
+	err = hu->proto->open(hu);
+	if (err) {
+		hu->hdev = NULL;
+		hci_free_dev(hdev);
+		return err;
+	}
+
 	if (test_bit(HCI_UART_INIT_PENDING, &hu->hdev_flags))
 		return 0;
 
 	if (hci_register_dev(hdev) < 0) {
 		BT_ERR("Can't register HCI device");
+		hu->proto->close(hu);
 		hu->hdev = NULL;
 		hci_free_dev(hdev);
 		return -ENODEV;
@@ -679,20 +708,14 @@ static int hci_uart_set_proto(struct hci_uart *hu, int id)
 	if (!p)
 		return -EPROTONOSUPPORT;
 
-	err = p->open(hu);
-	if (err)
-		return err;
-
 	hu->proto = p;
-	set_bit(HCI_UART_PROTO_READY, &hu->flags);
 
 	err = hci_uart_register_dev(hu);
 	if (err) {
-		clear_bit(HCI_UART_PROTO_READY, &hu->flags);
-		p->close(hu);
 		return err;
 	}
 
+	set_bit(HCI_UART_PROTO_READY, &hu->flags);
 	return 0;
 }
 
@@ -796,7 +819,7 @@ static ssize_t hci_uart_tty_write(struct tty_struct *tty, struct file *file,
 	return 0;
 }
 
-static unsigned int hci_uart_tty_poll(struct tty_struct *tty,
+static __poll_t hci_uart_tty_poll(struct tty_struct *tty,
 				      struct file *filp, poll_table *wait)
 {
 	return 0;

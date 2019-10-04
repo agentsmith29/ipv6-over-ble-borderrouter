@@ -1,14 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * SC16IS7xx tty serial driver - Copyright (C) 2014 GridPoint
  * Author: Jon Ringle <jringle@gridpoint.com>
  *
  *  Based on max310x.c, by Alexander Shiyan <shc_work@mail.ru>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -701,6 +696,8 @@ static bool sc16is7xx_port_irq(struct sc16is7xx_port *s, int portno)
 			rxlen = sc16is7xx_port_read(port, SC16IS7XX_RXLVL_REG);
 			if (rxlen)
 				sc16is7xx_handle_rx(port, rxlen, iir);
+			else
+				return false;
 			break;
 		case SC16IS7XX_IIR_THRI_SRC:
 			sc16is7xx_handle_tx(port);
@@ -1207,7 +1204,10 @@ static int sc16is7xx_probe(struct device *dev,
 		else
 			return PTR_ERR(s->clk);
 	} else {
-		clk_prepare_enable(s->clk);
+		ret = clk_prepare_enable(s->clk);
+		if (ret)
+			return ret;
+
 		freq = clk_get_rate(s->clk);
 	}
 
@@ -1511,7 +1511,7 @@ static int __init sc16is7xx_init(void)
 	ret = i2c_add_driver(&sc16is7xx_i2c_uart_driver);
 	if (ret < 0) {
 		pr_err("failed to init sc16is7xx i2c --> %d\n", ret);
-		return ret;
+		goto err_i2c;
 	}
 #endif
 
@@ -1519,9 +1519,19 @@ static int __init sc16is7xx_init(void)
 	ret = spi_register_driver(&sc16is7xx_spi_uart_driver);
 	if (ret < 0) {
 		pr_err("failed to init sc16is7xx spi --> %d\n", ret);
-		return ret;
+		goto err_spi;
 	}
 #endif
+	return ret;
+
+#ifdef CONFIG_SERIAL_SC16IS7XX_SPI
+err_spi:
+#ifdef CONFIG_SERIAL_SC16IS7XX_I2C
+	i2c_del_driver(&sc16is7xx_i2c_uart_driver);
+#endif
+#endif
+err_i2c:
+	uart_unregister_driver(&sc16is7xx_uart);
 	return ret;
 }
 module_init(sc16is7xx_init);

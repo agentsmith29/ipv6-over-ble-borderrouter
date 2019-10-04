@@ -565,8 +565,6 @@ ccio_io_pdir_entry(u64 *pdir_ptr, space_t sid, unsigned long vba,
 	/* We currently only support kernel addresses */
 	BUG_ON(sid != KERNEL_SPACE);
 
-	mtsp(sid,1);
-
 	/*
 	** WORD 1 - low order word
 	** "hints" parm includes the VALID bit!
@@ -597,7 +595,7 @@ ccio_io_pdir_entry(u64 *pdir_ptr, space_t sid, unsigned long vba,
 	** Grab virtual index [0:11]
 	** Deposit virt_idx bits into I/O PDIR word
 	*/
-	asm volatile ("lci %%r0(%%sr1, %1), %0" : "=r" (ci) : "r" (vba));
+	asm volatile ("lci %%r0(%1), %0" : "=r" (ci) : "r" (vba));
 	asm volatile ("extru %1,19,12,%0" : "+r" (ci) : "r" (ci));
 	asm volatile ("depw  %1,15,12,%0" : "+r" (pa) : "r" (ci));
 
@@ -1108,19 +1106,6 @@ static int ccio_proc_info(struct seq_file *m, void *p)
 	return 0;
 }
 
-static int ccio_proc_info_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, &ccio_proc_info, NULL);
-}
-
-static const struct file_operations ccio_proc_info_fops = {
-	.owner = THIS_MODULE,
-	.open = ccio_proc_info_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-
 static int ccio_proc_bitmap_info(struct seq_file *m, void *p)
 {
 	struct ioc *ioc = ioc_list;
@@ -1135,19 +1120,6 @@ static int ccio_proc_bitmap_info(struct seq_file *m, void *p)
 
 	return 0;
 }
-
-static int ccio_proc_bitmap_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, &ccio_proc_bitmap_info, NULL);
-}
-
-static const struct file_operations ccio_proc_bitmap_fops = {
-	.owner = THIS_MODULE,
-	.open = ccio_proc_bitmap_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
 #endif /* CONFIG_PROC_FS */
 
 /**
@@ -1195,7 +1167,7 @@ void * ccio_get_iommu(const struct parisc_device *dev)
  * to/from certain pages.  To avoid this happening, we mark these pages
  * as `used', and ensure that nothing will try to allocate from them.
  */
-void ccio_cujo20_fixup(struct parisc_device *cujo, u32 iovp)
+void __init ccio_cujo20_fixup(struct parisc_device *cujo, u32 iovp)
 {
 	unsigned int idx;
 	struct parisc_device *dev = parisc_parent(cujo);
@@ -1263,7 +1235,7 @@ static struct parisc_driver ccio_driver __refdata = {
  * I/O Page Directory, the resource map, and initalizing the
  * U2/Uturn chip into virtual mode.
  */
-static void
+static void __init
 ccio_ioc_init(struct ioc *ioc)
 {
 	int i;
@@ -1589,15 +1561,13 @@ static int __init ccio_probe(struct parisc_device *dev)
 
 #ifdef CONFIG_PROC_FS
 	if (ioc_count == 0) {
-		proc_create(MODULE_NAME, 0, proc_runway_root,
-			    &ccio_proc_info_fops);
-		proc_create(MODULE_NAME"-bitmap", 0, proc_runway_root,
-			    &ccio_proc_bitmap_fops);
+		proc_create_single(MODULE_NAME, 0, proc_runway_root,
+				ccio_proc_info);
+		proc_create_single(MODULE_NAME"-bitmap", 0, proc_runway_root,
+				ccio_proc_bitmap_info);
 	}
 #endif
 	ioc_count++;
-
-	parisc_has_iommu();
 	return 0;
 }
 

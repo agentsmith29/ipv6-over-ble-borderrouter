@@ -19,6 +19,7 @@
 #include <asm/cpu.h>
 #include <asm/cputype.h>
 #include <asm/cpufeature.h>
+#include <asm/fpsimd.h>
 
 #include <linux/bitops.h>
 #include <linux/bug.h>
@@ -26,6 +27,7 @@
 #include <linux/elf.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/of_platform.h>
 #include <linux/personality.h>
 #include <linux/preempt.h>
 #include <linux/printk.h>
@@ -69,6 +71,17 @@ static const char *const hwcap_str[] = {
 	"fcma",
 	"lrcpc",
 	"dcpop",
+	"sha3",
+	"sm3",
+	"sm4",
+	"asimddp",
+	"sha512",
+	"sve",
+	"asimdfhm",
+	"dit",
+	"uscat",
+	"ilrcpc",
+	"flagm",
 	NULL
 };
 
@@ -113,6 +126,10 @@ static int c_show(struct seq_file *m, void *v)
 {
 	int i, j;
 	bool compat = personality(current->personality) == PER_LINUX32;
+	struct device_node *np;
+	const char *model;
+	const char *serial;
+	u32 revision;
 
 	for_each_online_cpu(i) {
 		struct cpuinfo_arm64 *cpuinfo = &per_cpu(cpu_data, i);
@@ -162,6 +179,26 @@ static int c_show(struct seq_file *m, void *v)
 		seq_printf(m, "CPU variant\t: 0x%x\n", MIDR_VARIANT(midr));
 		seq_printf(m, "CPU part\t: 0x%03x\n", MIDR_PARTNUM(midr));
 		seq_printf(m, "CPU revision\t: %d\n\n", MIDR_REVISION(midr));
+	}
+
+	seq_printf(m, "Hardware\t: BCM2835\n");
+
+	np = of_find_node_by_path("/system");
+	if (np) {
+		if (!of_property_read_u32(np, "linux,revision", &revision))
+			seq_printf(m, "Revision\t: %04x\n", revision);
+		of_node_put(np);
+	}
+
+	np = of_find_node_by_path("/");
+	if (np) {
+		if (!of_property_read_string(np, "serial-number",
+					     &serial))
+			seq_printf(m, "Serial\t\t: %s\n", serial);
+		if (!of_property_read_string(np, "model",
+					     &model))
+			seq_printf(m, "Model\t\t: %s\n", model);
+		of_node_put(np);
 	}
 
 	return 0;
@@ -326,6 +363,7 @@ static void __cpuinfo_store_cpu(struct cpuinfo_arm64 *info)
 	info->reg_id_aa64mmfr2 = read_cpuid(ID_AA64MMFR2_EL1);
 	info->reg_id_aa64pfr0 = read_cpuid(ID_AA64PFR0_EL1);
 	info->reg_id_aa64pfr1 = read_cpuid(ID_AA64PFR1_EL1);
+	info->reg_id_aa64zfr0 = read_cpuid(ID_AA64ZFR0_EL1);
 
 	/* Update the 32bit ID registers only if AArch32 is implemented */
 	if (id_aa64pfr0_32bit_el0(info->reg_id_aa64pfr0)) {
@@ -347,6 +385,10 @@ static void __cpuinfo_store_cpu(struct cpuinfo_arm64 *info)
 		info->reg_mvfr1 = read_cpuid(MVFR1_EL1);
 		info->reg_mvfr2 = read_cpuid(MVFR2_EL1);
 	}
+
+	if (IS_ENABLED(CONFIG_ARM64_SVE) &&
+	    id_aa64pfr0_sve(info->reg_id_aa64pfr0))
+		info->reg_zcr = read_zcr_features();
 
 	cpuinfo_detect_icache_policy(info);
 }

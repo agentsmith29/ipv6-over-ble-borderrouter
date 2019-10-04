@@ -135,9 +135,9 @@ static int pm860x_rtc_set_time(struct device *dev, struct rtc_time *tm)
 	unsigned char buf[4];
 	unsigned long ticks, base, data;
 
-	if ((tm->tm_year < 70) || (tm->tm_year > 138)) {
+	if (tm->tm_year > 206) {
 		dev_dbg(info->dev, "Set time %d out of range. "
-			"Please set time between 1970 to 2038.\n",
+			"Please set time between 1970 to 2106.\n",
 			1900 + tm->tm_year);
 		return -EINVAL;
 	}
@@ -414,7 +414,7 @@ static int pm860x_rtc_remove(struct platform_device *pdev)
 	struct pm860x_rtc_info *info = platform_get_drvdata(pdev);
 
 #ifdef VRTC_CALIBRATION
-	flush_scheduled_work();
+	cancel_delayed_work_sync(&info->calib_work);
 	/* disable measurement */
 	pm860x_set_bits(info->i2c, PM8607_MEAS_EN2, MEAS2_VRTC, 0);
 #endif	/* VRTC_CALIBRATION */

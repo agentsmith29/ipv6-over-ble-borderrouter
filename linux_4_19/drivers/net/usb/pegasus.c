@@ -285,7 +285,7 @@ static void mdio_write(struct net_device *dev, int phy_id, int loc, int val)
 static int read_eprom_word(pegasus_t *pegasus, __u8 index, __u16 *retdata)
 {
 	int i;
-	__u8 tmp;
+	__u8 tmp = 0;
 	__le16 retdatai;
 	int ret;
 
@@ -1067,7 +1067,7 @@ static inline void setup_pegasus_II(pegasus_t *pegasus)
 
 	set_register(pegasus, Reg1d, 0);
 	set_register(pegasus, Reg7b, 1);
-	mdelay(100);
+	msleep(100);
 	if ((pegasus->features & HAS_HOME_PNA) && mii_mode)
 		set_register(pegasus, Reg7b, 0);
 	else

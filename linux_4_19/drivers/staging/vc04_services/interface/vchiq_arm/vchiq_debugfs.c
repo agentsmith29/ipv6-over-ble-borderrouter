@@ -32,7 +32,6 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-
 #include <linux/debugfs.h>
 #include "vchiq_core.h"
 #include "vchiq_arm.h"
@@ -53,8 +52,8 @@
 #define VCHIQ_LOG_TRACE_STR   "trace"
 
 /* Global 'vchiq' debugfs and clients entry used by all instances */
-struct dentry *vchiq_dbg_dir;
-struct dentry *vchiq_dbg_clients;
+static struct dentry *vchiq_dbg_dir;
+static struct dentry *vchiq_dbg_clients;
 
 /* Log category debugfs entries */
 struct vchiq_debugfs_log_entry {

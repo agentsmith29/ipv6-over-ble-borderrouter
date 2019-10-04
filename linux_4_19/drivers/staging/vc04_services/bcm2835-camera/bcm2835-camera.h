@@ -1,11 +1,8 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Broadcom BM2835 V4L2 driver
  *
  * Copyright © 2013 Raspberry Pi (Trading) Ltd.
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file COPYING in the main directory of this archive
- * for more details.
  *
  * Authors: Vincent Sanders @ Collabora
  *          Dave Stevenson @ Broadcom
@@ -95,7 +92,7 @@ struct bm2835_mmal_dev {
 		/* Kernel start timestamp for streaming */
 		ktime_t kernel_start_ts;
 		/* Timestamp of last frame */
-		u64 		last_timestamp;
+		u64		last_timestamp;
 		/* Sequence number of last buffer */
 		u32		sequence;
 

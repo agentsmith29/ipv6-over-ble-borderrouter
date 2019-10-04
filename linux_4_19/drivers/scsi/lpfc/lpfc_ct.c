@@ -1,8 +1,8 @@
 /*******************************************************************
  * This file is part of the Emulex Linux Device Driver for         *
  * Fibre Channel Host Bus Adapters.                                *
- * Copyright (C) 2017 Broadcom. All Rights Reserved. The term      *
- * “Broadcom” refers to Broadcom Limited and/or its subsidiaries.  *
+ * Copyright (C) 2017-2018 Broadcom. All Rights Reserved. The term *
+ * “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.     *
  * Copyright (C) 2004-2016 Emulex.  All rights reserved.           *
  * EMULEX and SLI are trademarks of Emulex.                        *
  * www.broadcom.com                                                *
@@ -471,7 +471,11 @@ lpfc_prep_node_fc4type(struct lpfc_vport *vport, uint32_t Did, uint8_t fc4_type)
 				"Parse GID_FTrsp: did:x%x flg:x%x x%x",
 				Did, ndlp->nlp_flag, vport->fc_flag);
 
+			/* Don't assume the rport is always the previous
+			 * FC4 type.
+			 */
 			ndlp->nlp_fc4_type &= ~(NLP_FC4_FCP | NLP_FC4_NVME);
+
 			/* By default, the driver expects to support FCP FC4 */
 			if (fc4_type == FC_TYPE_FCP)
 				ndlp->nlp_fc4_type |= NLP_FC4_FCP;
@@ -686,6 +690,30 @@ lpfc_cmpl_ct_cmd_gid_ft(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 			lpfc_els_flush_rscn(vport);
 		goto out;
 	}
+
+	spin_lock_irq(shost->host_lock);
+	if (vport->fc_flag & FC_RSCN_DEFERRED) {
+		vport->fc_flag &= ~FC_RSCN_DEFERRED;
+		spin_unlock_irq(shost->host_lock);
+
+		/* This is a GID_FT completing so the gidft_inp counter was
+		 * incremented before the GID_FT was issued to the wire.
+		 */
+		vport->gidft_inp--;
+
+		/*
+		 * Skip processing the NS response
+		 * Re-issue the NS cmd
+		 */
+		lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS,
+				 "0151 Process Deferred RSCN Data: x%x x%x\n",
+				 vport->fc_flag, vport->fc_rscn_id_cnt);
+		lpfc_els_handle_rscn(vport);
+
+		goto out;
+	}
+	spin_unlock_irq(shost->host_lock);
+
 	if (irsp->ulpStatus) {
 		/* Check for retry */
 		if (vport->fc_ns_retry < LPFC_MAX_NS_RETRY) {
@@ -1192,7 +1220,7 @@ lpfc_vport_symbolic_port_name(struct lpfc_vport *vport, char *symbol,
 	 * Name object.  NPIV is not in play so this integer
 	 * value is sufficient and unique per FC-ID.
 	 */
-	n = snprintf(symbol, size, "%d", vport->phba->brd_no);
+	n = scnprintf(symbol, size, "%d", vport->phba->brd_no);
 	return n;
 }
 
@@ -1206,26 +1234,26 @@ lpfc_vport_symbolic_node_name(struct lpfc_vport *vport, char *symbol,
 
 	lpfc_decode_firmware_rev(vport->phba, fwrev, 0);
 
-	n = snprintf(symbol, size, "Emulex %s", vport->phba->ModelName);
+	n = scnprintf(symbol, size, "Emulex %s", vport->phba->ModelName);
 	if (size < n)
 		return n;
 
-	n += snprintf(symbol + n, size - n, " FV%s", fwrev);
+	n += scnprintf(symbol + n, size - n, " FV%s", fwrev);
 	if (size < n)
 		return n;
 
-	n += snprintf(symbol + n, size - n, " DV%s.",
+	n += scnprintf(symbol + n, size - n, " DV%s.",
 		      lpfc_release_version);
 	if (size < n)
 		return n;
 
-	n += snprintf(symbol + n, size - n, " HN:%s.",
+	n += scnprintf(symbol + n, size - n, " HN:%s.",
 		      init_utsname()->nodename);
 	if (size < n)
 		return n;
 
 	/* Note :- OS name is "Linux" */
-	n += snprintf(symbol + n, size - n, " OS:%s\n",
+	n += scnprintf(symbol + n, size - n, " OS:%s\n",
 		      init_utsname()->sysname);
 	return n;
 }
@@ -1734,6 +1762,9 @@ lpfc_fdmi_hba_attr_manufacturer(struct lpfc_vport *vport,
 	ae = (struct lpfc_fdmi_attr_entry *)&ad->AttrValue;
 	memset(ae, 0, 256);
 
+	/* This string MUST be consistent with other FC platforms
+	 * supported by Broadcom.
+	 */
 	strncpy(ae->un.AttrString,
 		"Emulex Corporation",
 		       sizeof(ae->un.AttrString));
@@ -2089,10 +2120,11 @@ lpfc_fdmi_port_attr_fc4type(struct lpfc_vport *vport,
 	ae = (struct lpfc_fdmi_attr_entry *)&ad->AttrValue;
 	memset(ae, 0, 32);
 
-	ae->un.AttrTypes[3] = 0x02; /* Type 1 - ELS */
-	ae->un.AttrTypes[2] = 0x01; /* Type 8 - FCP */
-	ae->un.AttrTypes[6] = 0x01; /* Type 40 - NVME */
-	ae->un.AttrTypes[7] = 0x01; /* Type 32 - CT */
+	ae->un.AttrTypes[3] = 0x02; /* Type 0x1 - ELS */
+	ae->un.AttrTypes[2] = 0x01; /* Type 0x8 - FCP */
+	if (vport->nvmei_support || vport->phba->nvmet_support)
+		ae->un.AttrTypes[6] = 0x01; /* Type 0x28 - NVME */
+	ae->un.AttrTypes[7] = 0x01; /* Type 0x20 - CT */
 	size = FOURBYTES + 32;
 	ad->AttrLen = cpu_to_be16(size);
 	ad->AttrType = cpu_to_be16(RPRT_SUPPORTED_FC4_TYPES);
@@ -2111,6 +2143,8 @@ lpfc_fdmi_port_attr_support_speed(struct lpfc_vport *vport,
 
 	ae->un.AttrInt = 0;
 	if (!(phba->hba_flag & HBA_FCOE_MODE)) {
+		if (phba->lmt & LMT_64Gb)
+			ae->un.AttrInt |= HBA_PORTSPEED_64GFC;
 		if (phba->lmt & LMT_32Gb)
 			ae->un.AttrInt |= HBA_PORTSPEED_32GFC;
 		if (phba->lmt & LMT_16Gb)
@@ -2181,6 +2215,9 @@ lpfc_fdmi_port_attr_speed(struct lpfc_vport *vport,
 			break;
 		case LPFC_LINK_SPEED_32GHZ:
 			ae->un.AttrInt = HBA_PORTSPEED_32GFC;
+			break;
+		case LPFC_LINK_SPEED_64GHZ:
+			ae->un.AttrInt = HBA_PORTSPEED_64GFC;
 			break;
 		default:
 			ae->un.AttrInt = HBA_PORTSPEED_UNKNOWN;
@@ -2392,9 +2429,11 @@ lpfc_fdmi_port_attr_active_fc4type(struct lpfc_vport *vport,
 	ae = (struct lpfc_fdmi_attr_entry *)&ad->AttrValue;
 	memset(ae, 0, 32);
 
-	ae->un.AttrTypes[3] = 0x02; /* Type 1 - ELS */
-	ae->un.AttrTypes[2] = 0x01; /* Type 8 - FCP */
-	ae->un.AttrTypes[7] = 0x01; /* Type 32 - CT */
+	ae->un.AttrTypes[3] = 0x02; /* Type 0x1 - ELS */
+	ae->un.AttrTypes[2] = 0x01; /* Type 0x8 - FCP */
+	if (vport->phba->cfg_enable_fc4_type & LPFC_ENABLE_NVME)
+		ae->un.AttrTypes[6] = 0x1; /* Type 0x28 - NVME */
+	ae->un.AttrTypes[7] = 0x01; /* Type 0x20 - CT */
 	size = FOURBYTES + 32;
 	ad->AttrLen = cpu_to_be16(size);
 	ad->AttrType = cpu_to_be16(RPRT_ACTIVE_FC4_TYPES);
@@ -2885,9 +2924,9 @@ fdmi_cmd_exit:
  * the worker thread.
  **/
 void
-lpfc_delayed_disc_tmo(unsigned long ptr)
+lpfc_delayed_disc_tmo(struct timer_list *t)
 {
-	struct lpfc_vport *vport = (struct lpfc_vport *)ptr;
+	struct lpfc_vport *vport = from_timer(vport, t, delayed_disc_tmo);
 	struct lpfc_hba   *phba = vport->phba;
 	uint32_t tmo_posted;
 	unsigned long iflag;

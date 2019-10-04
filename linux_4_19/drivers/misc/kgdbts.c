@@ -400,10 +400,14 @@ static void skip_back_repeat_test(char *arg)
 	int go_back = simple_strtol(arg, NULL, 10);
 
 	repeat_test--;
-	if (repeat_test <= 0)
+	if (repeat_test <= 0) {
 		ts.idx++;
-	else
+	} else {
+		if (repeat_test % 100 == 0)
+			v1printk("kgdbts:RUN ... %d remaining\n", repeat_test);
+
 		ts.idx -= go_back;
+	}
 	fill_get_buf(ts.tst[ts.idx].get);
 }
 
@@ -1132,9 +1136,10 @@ static void kgdbts_put_char(u8 chr)
 		ts.run_test(0, chr);
 }
 
-static int param_set_kgdbts_var(const char *kmessage, struct kernel_param *kp)
+static int param_set_kgdbts_var(const char *kmessage,
+				const struct kernel_param *kp)
 {
-	int len = strlen(kmessage);
+	size_t len = strlen(kmessage);
 
 	if (len >= MAX_CONFIG_LEN) {
 		printk(KERN_ERR "kgdbts: config string too long\n");
@@ -1154,7 +1159,7 @@ static int param_set_kgdbts_var(const char *kmessage, struct kernel_param *kp)
 
 	strcpy(config, kmessage);
 	/* Chop out \n char as a result of echo */
-	if (config[len - 1] == '\n')
+	if (len && config[len - 1] == '\n')
 		config[len - 1] = '\0';
 
 	/* Go and configure with the new params. */

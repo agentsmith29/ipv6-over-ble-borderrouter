@@ -273,7 +273,8 @@ static int pwm_export_child(struct device *parent, struct pwm_device *pwm)
 	ret = device_register(&export->child);
 	if (ret) {
 		clear_bit(PWMF_EXPORTED, &pwm->flags);
-		kfree(export);
+		put_device(&export->child);
+		export = NULL;
 		return ret;
 	}
 	pwm_prop[0] = kasprintf(GFP_KERNEL, "EXPORT=pwm%u", pwm->hwpwm);
@@ -410,19 +411,6 @@ void pwmchip_sysfs_export(struct pwm_chip *chip)
 void pwmchip_sysfs_unexport(struct pwm_chip *chip)
 {
 	struct device *parent;
-
-	parent = class_find_device(&pwm_class, NULL, chip,
-				   pwmchip_sysfs_match);
-	if (parent) {
-		/* for class_find_device() */
-		put_device(parent);
-		device_unregister(parent);
-	}
-}
-
-void pwmchip_sysfs_unexport_children(struct pwm_chip *chip)
-{
-	struct device *parent;
 	unsigned int i;
 
 	parent = class_find_device(&pwm_class, NULL, chip,
@@ -438,6 +426,7 @@ void pwmchip_sysfs_unexport_children(struct pwm_chip *chip)
 	}
 
 	put_device(parent);
+	device_unregister(parent);
 }
 
 static int __init pwm_sysfs_init(void)

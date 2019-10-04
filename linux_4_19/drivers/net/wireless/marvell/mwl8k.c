@@ -199,7 +199,7 @@ struct mwl8k_priv {
 	struct ieee80211_channel channels_24[14];
 	struct ieee80211_rate rates_24[13];
 	struct ieee80211_supported_band band_50;
-	struct ieee80211_channel channels_50[4];
+	struct ieee80211_channel channels_50[9];
 	struct ieee80211_rate rates_50[8];
 	u32 ap_macids_supported;
 	u32 sta_macids_supported;
@@ -383,6 +383,11 @@ static const struct ieee80211_channel mwl8k_channels_50[] = {
 	{ .band = NL80211_BAND_5GHZ, .center_freq = 5200, .hw_value = 40, },
 	{ .band = NL80211_BAND_5GHZ, .center_freq = 5220, .hw_value = 44, },
 	{ .band = NL80211_BAND_5GHZ, .center_freq = 5240, .hw_value = 48, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5745, .hw_value = 149, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5765, .hw_value = 153, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5785, .hw_value = 157, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5805, .hw_value = 161, },
+	{ .band = NL80211_BAND_5GHZ, .center_freq = 5825, .hw_value = 165, },
 };
 
 static const struct ieee80211_rate mwl8k_rates_50[] = {
@@ -435,6 +440,9 @@ static const struct ieee80211_rate mwl8k_rates_50[] = {
 #define MWL8K_CMD_UPDATE_ENCRYPTION	0x1122		/* per-vif */
 #define MWL8K_CMD_UPDATE_STADB		0x1123
 #define MWL8K_CMD_BASTREAM		0x1125
+
+#define MWL8K_LEGACY_5G_RATE_OFFSET \
+	(ARRAY_SIZE(mwl8k_rates_24) - ARRAY_SIZE(mwl8k_rates_50))
 
 static const char *mwl8k_cmd_name(__le16 cmd, char *buf, int bufsize)
 {
@@ -1011,8 +1019,9 @@ mwl8k_rxd_ap_process(void *_rxd, struct ieee80211_rx_status *status,
 
 	if (rxd->channel > 14) {
 		status->band = NL80211_BAND_5GHZ;
-		if (!(status->encoding == RX_ENC_HT))
-			status->rate_idx -= 5;
+		if (!(status->encoding == RX_ENC_HT) &&
+		    status->rate_idx >= MWL8K_LEGACY_5G_RATE_OFFSET)
+			status->rate_idx -= MWL8K_LEGACY_5G_RATE_OFFSET;
 	} else {
 		status->band = NL80211_BAND_2GHZ;
 	}
@@ -1119,8 +1128,9 @@ mwl8k_rxd_sta_process(void *_rxd, struct ieee80211_rx_status *status,
 
 	if (rxd->channel > 14) {
 		status->band = NL80211_BAND_5GHZ;
-		if (!(status->encoding == RX_ENC_HT))
-			status->rate_idx -= 5;
+		if (!(status->encoding == RX_ENC_HT) &&
+		    status->rate_idx >= MWL8K_LEGACY_5G_RATE_OFFSET)
+			status->rate_idx -= MWL8K_LEGACY_5G_RATE_OFFSET;
 	} else {
 		status->band = NL80211_BAND_2GHZ;
 	}

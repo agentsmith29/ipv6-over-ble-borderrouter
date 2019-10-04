@@ -92,15 +92,15 @@ static const struct snd_soc_dapm_route audiosense_pi_audio_map[] = {
 static int audiosense_pi_card_init(struct snd_soc_pcm_runtime *rtd)
 {
 	/* TODO: init of the codec specific dapm data, ignore suspend/resume */
-	struct snd_soc_codec *codec = rtd->codec;
+	struct snd_soc_component *component = rtd->codec_dai->component;
 
-	snd_soc_update_bits(codec, AIC32X4_MICBIAS, 0x78,
-			AIC32X4_MICBIAS_LDOIN |
-			AIC32X4_MICBIAS_2075V);
-	snd_soc_update_bits(codec, AIC32X4_PWRCFG, 0x08,
-			AIC32X4_AVDDWEAKDISABLE);
-	snd_soc_update_bits(codec, AIC32X4_LDOCTL, 0x01,
-			AIC32X4_LDOCTLEN);
+	snd_soc_component_update_bits(component, AIC32X4_MICBIAS, 0x78,
+				      AIC32X4_MICBIAS_LDOIN |
+				      AIC32X4_MICBIAS_2075V);
+	snd_soc_component_update_bits(component, AIC32X4_PWRCFG, 0x08,
+				      AIC32X4_AVDDWEAKDISABLE);
+	snd_soc_component_update_bits(component, AIC32X4_LDOCTL, 0x01,
+				      AIC32X4_LDOCTLEN);
 
 	return 0;
 }
@@ -115,10 +115,10 @@ static int audiosense_pi_card_hw_params(
 
 	/* Set the codec system clock, there is a 12 MHz XTAL on the board */
 	ret = snd_soc_dai_set_sysclk(codec_dai, AIC32X4_SYSCLK_XTAL,
-			AIC32X4_FREQ_12000000, SND_SOC_CLOCK_IN);
+				     12000000, SND_SOC_CLOCK_IN);
 	if (ret) {
 		dev_err(rtd->card->dev,
-				"could not set codec driver clock params\n");
+			"could not set codec driver clock params\n");
 		return ret;
 	}
 	return 0;
@@ -133,15 +133,15 @@ static int audiosense_pi_card_startup(struct snd_pcm_substream *substream)
 	 */
 	runtime->hw.channels_max = 2;
 	snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
-			&audiosense_constraints_ch);
+				   &audiosense_constraints_ch);
 
 	runtime->hw.formats = SNDRV_PCM_FMTBIT_S16_LE;
 	snd_pcm_hw_constraint_msbits(runtime, 0, 16, 16);
 
 
 	snd_pcm_hw_constraint_list(substream->runtime, 0,
-			SNDRV_PCM_HW_PARAM_RATE,
-			&audiosense_constraints_rates);
+				   SNDRV_PCM_HW_PARAM_RATE,
+				   &audiosense_constraints_rates);
 	return 0;
 }
 
@@ -194,7 +194,7 @@ static int audiosense_pi_card_probe(struct platform_device *pdev)
 	i2s_node = of_parse_phandle(pdev->dev.of_node, "i2s-controller", 0);
 	if (!i2s_node) {
 		dev_err(&pdev->dev,
-				"Property 'i2s-controller' missing or invalid\n");
+			"Property 'i2s-controller' missing or invalid\n");
 		return -EINVAL;
 	}
 
@@ -208,7 +208,7 @@ static int audiosense_pi_card_probe(struct platform_device *pdev)
 	ret = snd_soc_register_card(card);
 	if (ret && ret != -EPROBE_DEFER)
 		dev_err(&pdev->dev,
-				"snd_soc_register_card() failed: %d\n", ret);
+			"snd_soc_register_card() failed: %d\n", ret);
 
 	return ret;
 }

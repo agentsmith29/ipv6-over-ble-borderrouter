@@ -114,7 +114,9 @@ For 32-bit we have the following conventions - kernel is built with
 	pushq   %rsi		/* pt_regs->si */
 	.endif
 	pushq	\rdx		/* pt_regs->dx */
+	xorl	%edx, %edx	/* nospec   dx */
 	pushq   %rcx		/* pt_regs->cx */
+	xorl	%ecx, %ecx	/* nospec   cx */
 	pushq   \rax		/* pt_regs->ax */
 	pushq   %r8		/* pt_regs->r8 */
 	xorl	%r8d, %r8d	/* nospec   r8 */
@@ -181,12 +183,7 @@ For 32-bit we have the following conventions - kernel is built with
  */
 .macro ENCODE_FRAME_POINTER ptregs_offset=0
 #ifdef CONFIG_FRAME_POINTER
-	.if \ptregs_offset
-		leaq \ptregs_offset(%rsp), %rbp
-	.else
-		mov %rsp, %rbp
-	.endif
-	orq	$0x1, %rbp
+	leaq 1+\ptregs_offset(%rsp), %rbp
 #endif
 .endm
 
@@ -332,6 +329,23 @@ For 32-bit we have the following conventions - kernel is built with
 
 #endif
 
+/*
+ * Mitigate Spectre v1 for conditional swapgs code paths.
+ *
+ * FENCE_SWAPGS_USER_ENTRY is used in the user entry swapgs code path, to
+ * prevent a speculative swapgs when coming from kernel space.
+ *
+ * FENCE_SWAPGS_KERNEL_ENTRY is used in the kernel entry non-swapgs code path,
+ * to prevent the swapgs from getting speculatively skipped when coming from
+ * user space.
+ */
+.macro FENCE_SWAPGS_USER_ENTRY
+	ALTERNATIVE "", "lfence", X86_FEATURE_FENCE_SWAPGS_USER
+.endm
+.macro FENCE_SWAPGS_KERNEL_ENTRY
+	ALTERNATIVE "", "lfence", X86_FEATURE_FENCE_SWAPGS_KERNEL
+.endm
+
 #endif /* CONFIG_X86_64 */
 
 /*
@@ -340,7 +354,7 @@ For 32-bit we have the following conventions - kernel is built with
  */
 .macro CALL_enter_from_user_mode
 #ifdef CONFIG_CONTEXT_TRACKING
-#ifdef HAVE_JUMP_LABEL
+#ifdef CONFIG_JUMP_LABEL
 	STATIC_JUMP_IF_FALSE .Lafter_call_\@, context_tracking_enabled, def=0
 #endif
 	call enter_from_user_mode

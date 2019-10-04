@@ -323,7 +323,7 @@ static int find_pattern(const char *data, size_t dlen,
 		i++;
 	}
 
-	pr_debug("Skipped up to `%c'!\n", skip);
+	pr_debug("Skipped up to 0x%hhx delimiter!\n", skip);
 
 	*numoff = i;
 	*numlen = getnum(data + i, dlen - i, cmd, term, numoff);
@@ -566,8 +566,7 @@ static const struct nf_conntrack_expect_policy ftp_exp_policy = {
 	.timeout	= 5 * 60,
 };
 
-/* don't make this __exit, since it's called from __init ! */
-static void nf_conntrack_ftp_fini(void)
+static void __exit nf_conntrack_ftp_fini(void)
 {
 	nf_conntrack_helpers_unregister(ftp, ports_c * 2);
 	kfree(ftp_buffer);

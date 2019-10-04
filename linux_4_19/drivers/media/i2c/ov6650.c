@@ -201,7 +201,7 @@ struct ov6650 {
 	struct v4l2_rect	rect;		/* sensor cropping window */
 	unsigned long		pclk_limit;	/* from host */
 	unsigned long		pclk_max;	/* from resolution and format */
-	struct v4l2_fract	tpf;		/* as requested with s_parm */
+	struct v4l2_fract	tpf;		/* as requested with s_frame_interval */
 	u32 code;
 	enum v4l2_colorspace	colorspace;
 };
@@ -723,41 +723,30 @@ static int ov6650_enum_mbus_code(struct v4l2_subdev *sd,
 	return 0;
 }
 
-static int ov6650_g_parm(struct v4l2_subdev *sd, struct v4l2_streamparm *parms)
+static int ov6650_g_frame_interval(struct v4l2_subdev *sd,
+				   struct v4l2_subdev_frame_interval *ival)
 {
 	struct i2c_client *client = v4l2_get_subdevdata(sd);
 	struct ov6650 *priv = to_ov6650(client);
-	struct v4l2_captureparm *cp = &parms->parm.capture;
 
-	if (parms->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
-
-	memset(cp, 0, sizeof(*cp));
-	cp->capability = V4L2_CAP_TIMEPERFRAME;
-	cp->timeperframe.numerator = GET_CLKRC_DIV(to_clkrc(&priv->tpf,
+	ival->interval.numerator = GET_CLKRC_DIV(to_clkrc(&priv->tpf,
 			priv->pclk_limit, priv->pclk_max));
-	cp->timeperframe.denominator = FRAME_RATE_MAX;
+	ival->interval.denominator = FRAME_RATE_MAX;
 
 	dev_dbg(&client->dev, "Frame interval: %u/%u s\n",
-		cp->timeperframe.numerator, cp->timeperframe.denominator);
+		ival->interval.numerator, ival->interval.denominator);
 
 	return 0;
 }
 
-static int ov6650_s_parm(struct v4l2_subdev *sd, struct v4l2_streamparm *parms)
+static int ov6650_s_frame_interval(struct v4l2_subdev *sd,
+				   struct v4l2_subdev_frame_interval *ival)
 {
 	struct i2c_client *client = v4l2_get_subdevdata(sd);
 	struct ov6650 *priv = to_ov6650(client);
-	struct v4l2_captureparm *cp = &parms->parm.capture;
-	struct v4l2_fract *tpf = &cp->timeperframe;
+	struct v4l2_fract *tpf = &ival->interval;
 	int div, ret;
 	u8 clkrc;
-
-	if (parms->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
-
-	if (cp->extendedmode != 0)
-		return -EINVAL;
 
 	if (tpf->numerator == 0 || tpf->denominator == 0)
 		div = 1;  /* Reset to full rate */
@@ -822,9 +811,18 @@ static int ov6650_video_probe(struct i2c_client *client)
 	u8		pidh, pidl, midh, midl;
 	int		ret;
 
+	priv->clk = v4l2_clk_get(&client->dev, NULL);
+	if (IS_ERR(priv->clk)) {
+		ret = PTR_ERR(priv->clk);
+		dev_err(&client->dev, "v4l2_clk request err: %d\n", ret);
+		return ret;
+	}
+
 	ret = ov6650_s_power(&priv->subdev, 1);
 	if (ret < 0)
-		return ret;
+		goto eclkput;
+
+	msleep(20);
 
 	/*
 	 * check and show product ID and manufacturer ID
@@ -859,6 +857,11 @@ static int ov6650_video_probe(struct i2c_client *client)
 
 done:
 	ov6650_s_power(&priv->subdev, 0);
+	if (!ret)
+		return 0;
+eclkput:
+	v4l2_clk_put(priv->clk);
+
 	return ret;
 }
 
@@ -921,8 +924,8 @@ static int ov6650_s_mbus_config(struct v4l2_subdev *sd,
 
 static const struct v4l2_subdev_video_ops ov6650_video_ops = {
 	.s_stream	= ov6650_s_stream,
-	.g_parm		= ov6650_g_parm,
-	.s_parm		= ov6650_s_parm,
+	.g_frame_interval = ov6650_g_frame_interval,
+	.s_frame_interval = ov6650_s_frame_interval,
 	.g_mbus_config	= ov6650_g_mbus_config,
 	.s_mbus_config	= ov6650_s_mbus_config,
 };
@@ -951,11 +954,8 @@ static int ov6650_probe(struct i2c_client *client,
 	int ret;
 
 	priv = devm_kzalloc(&client->dev, sizeof(*priv), GFP_KERNEL);
-	if (!priv) {
-		dev_err(&client->dev,
-			"Failed to allocate memory for private data!\n");
+	if (!priv)
 		return -ENOMEM;
-	}
 
 	v4l2_i2c_subdev_init(&priv->subdev, client, &ov6650_subdev_ops);
 	v4l2_ctrl_handler_init(&priv->hdl, 13);
@@ -1004,18 +1004,9 @@ static int ov6650_probe(struct i2c_client *client,
 	priv->code	  = MEDIA_BUS_FMT_YUYV8_2X8;
 	priv->colorspace  = V4L2_COLORSPACE_JPEG;
 
-	priv->clk = v4l2_clk_get(&client->dev, NULL);
-	if (IS_ERR(priv->clk)) {
-		ret = PTR_ERR(priv->clk);
-		goto eclkget;
-	}
-
 	ret = ov6650_video_probe(client);
-	if (ret) {
-		v4l2_clk_put(priv->clk);
-eclkget:
+	if (ret)
 		v4l2_ctrl_handler_free(&priv->hdl);
-	}
 
 	return ret;
 }

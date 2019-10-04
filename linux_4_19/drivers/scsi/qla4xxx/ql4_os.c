@@ -843,11 +843,9 @@ static int qla4xxx_delete_chap(struct Scsi_Host *shost, uint16_t chap_tbl_idx)
 	uint32_t chap_size;
 	int ret = 0;
 
-	chap_table = dma_pool_alloc(ha->chap_dma_pool, GFP_KERNEL, &chap_dma);
+	chap_table = dma_pool_zalloc(ha->chap_dma_pool, GFP_KERNEL, &chap_dma);
 	if (chap_table == NULL)
 		return -ENOMEM;
-
-	memset(chap_table, 0, sizeof(struct ql4_chap_table));
 
 	if (is_qla80XX(ha))
 		max_chap_entries = (ha->hw.flt_chap_size / 2) /
@@ -1850,7 +1848,7 @@ static enum blk_eh_timer_return qla4xxx_eh_cmd_timed_out(struct scsi_cmnd *sc)
 	struct iscsi_cls_session *session;
 	struct iscsi_session *sess;
 	unsigned long flags;
-	enum blk_eh_timer_return ret = BLK_EH_NOT_HANDLED;
+	enum blk_eh_timer_return ret = BLK_EH_DONE;
 
 	session = starget_to_session(scsi_target(sc->device));
 	sess = session->dd_data;
@@ -2707,16 +2705,15 @@ qla4xxx_iface_set_param(struct Scsi_Host *shost, void *data, uint32_t len)
 	uint32_t rem = len;
 	struct nlattr *attr;
 
-	init_fw_cb = dma_alloc_coherent(&ha->pdev->dev,
-					sizeof(struct addr_ctrl_blk),
-					&init_fw_cb_dma, GFP_KERNEL);
+	init_fw_cb = dma_zalloc_coherent(&ha->pdev->dev,
+					 sizeof(struct addr_ctrl_blk),
+					 &init_fw_cb_dma, GFP_KERNEL);
 	if (!init_fw_cb) {
 		ql4_printk(KERN_ERR, ha, "%s: Unable to alloc init_cb\n",
 			   __func__);
 		return -ENOMEM;
 	}
 
-	memset(init_fw_cb, 0, sizeof(struct addr_ctrl_blk));
 	memset(&mbox_cmd, 0, sizeof(mbox_cmd));
 	memset(&mbox_sts, 0, sizeof(mbox_sts));
 
@@ -3207,6 +3204,8 @@ static int qla4xxx_conn_bind(struct iscsi_cls_session *cls_session,
 	if (iscsi_conn_bind(cls_session, cls_conn, is_leading))
 		return -EINVAL;
 	ep = iscsi_lookup_endpoint(transport_fd);
+	if (!ep)
+		return -EINVAL;
 	conn = cls_conn->dd_data;
 	qla_conn = conn->dd_data;
 	qla_conn->qla_ep = ep->dd_data;
@@ -3973,16 +3972,15 @@ exit_session_conn_param:
 /*
  * Timer routines
  */
+static void qla4xxx_timer(struct timer_list *t);
 
-static void qla4xxx_start_timer(struct scsi_qla_host *ha, void *func,
+static void qla4xxx_start_timer(struct scsi_qla_host *ha,
 				unsigned long interval)
 {
 	DEBUG(printk("scsi: %s: Starting timer thread for adapter %d\n",
 		     __func__, ha->host->host_no));
-	init_timer(&ha->timer);
+	timer_setup(&ha->timer, qla4xxx_timer, 0);
 	ha->timer.expires = jiffies + interval * HZ;
-	ha->timer.data = (unsigned long)ha;
-	ha->timer.function = (void (*)(unsigned long))func;
 	add_timer(&ha->timer);
 	ha->timer_active = 1;
 }
@@ -4215,15 +4213,14 @@ static int qla4xxx_mem_alloc(struct scsi_qla_host *ha)
 			  sizeof(struct shadow_regs) +
 			  MEM_ALIGN_VALUE +
 			  (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1);
-	ha->queues = dma_alloc_coherent(&ha->pdev->dev, ha->queues_len,
-					&ha->queues_dma, GFP_KERNEL);
+	ha->queues = dma_zalloc_coherent(&ha->pdev->dev, ha->queues_len,
+					 &ha->queues_dma, GFP_KERNEL);
 	if (ha->queues == NULL) {
 		ql4_printk(KERN_WARNING, ha,
 		    "Memory Allocation failed - queues.\n");
 
 		goto mem_alloc_error_exit;
 	}
-	memset(ha->queues, 0, ha->queues_len);
 
 	/*
 	 * As per RISC alignment requirements -- the bus-address must be a
@@ -4526,8 +4523,9 @@ static void qla4xxx_check_relogin_flash_ddb(struct iscsi_cls_session *cls_sess)
  * qla4xxx_timer - checks every second for work to do.
  * @ha: Pointer to host adapter structure.
  **/
-static void qla4xxx_timer(struct scsi_qla_host *ha)
+static void qla4xxx_timer(struct timer_list *t)
 {
+	struct scsi_qla_host *ha = from_timer(ha, t, timer);
 	int start_dpc = 0;
 	uint16_t w;
 
@@ -5937,7 +5935,7 @@ static int get_fw_boot_info(struct scsi_qla_host *ha, uint16_t ddb_index[])
 		val = rd_nvram_byte(ha, sec_addr);
 		if (val & BIT_7)
 			ddb_index[1] = (val & 0x7f);
-
+		goto exit_boot_info;
 	} else if (is_qla80XX(ha)) {
 		buf = dma_alloc_coherent(&ha->pdev->dev, size,
 					 &buf_dma, GFP_KERNEL);
@@ -7241,6 +7239,8 @@ static int qla4xxx_sysfs_ddb_tgt_create(struct scsi_qla_host *ha,
 
 	rc = qla4xxx_copy_from_fwddb_param(fnode_sess, fnode_conn,
 					   fw_ddb_entry);
+	if (rc)
+		goto free_sess;
 
 	ql4_printk(KERN_INFO, ha, "%s: sysfs entry %s created\n",
 		   __func__, fnode_sess->dev.kobj.name);
@@ -8823,7 +8823,7 @@ skip_retry_init:
 	ha->isp_ops->enable_intrs(ha);
 
 	/* Start timer thread. */
-	qla4xxx_start_timer(ha, qla4xxx_timer, 1);
+	qla4xxx_start_timer(ha, 1);
 
 	set_bit(AF_INIT_DONE, &ha->flags);
 

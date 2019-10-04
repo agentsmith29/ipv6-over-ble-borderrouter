@@ -38,14 +38,14 @@
 /plugin/;
 
 / {
-	compatible = "brcm,bcm2708";
+	compatible = "brcm,bcm2835";
 
 	fragment@0 {
 		target-path = "/";
 		__overlay__ {
 			fan0: gpio-fan@0 {
 				compatible = "gpio-fan";
-				gpios = <&gpio 12 1>;
+				gpios = <&gpio 12 0>;
 				gpio-fan,speed-map = <0    0>,
 									 <5000 1>;
 				#cooling-cells = <2>;

@@ -81,6 +81,8 @@ int fscrypt_ioctl_set_policy(struct file *filp, const void __user *arg)
 	if (ret == -ENODATA) {
 		if (!S_ISDIR(inode->i_mode))
 			ret = -ENOTDIR;
+		else if (IS_DEADDIR(inode))
+			ret = -ENOENT;
 		else if (!inode->i_sb->s_cop->empty_dir(inode))
 			ret = -ENOTEMPTY;
 		else
@@ -110,7 +112,7 @@ int fscrypt_ioctl_get_policy(struct file *filp, void __user *arg)
 	struct fscrypt_policy policy;
 	int res;
 
-	if (!inode->i_sb->s_cop->is_encrypted(inode))
+	if (!IS_ENCRYPTED(inode))
 		return -ENODATA;
 
 	res = inode->i_sb->s_cop->get_context(inode, &ctx, sizeof(ctx));
@@ -167,11 +169,11 @@ int fscrypt_has_permitted_context(struct inode *parent, struct inode *child)
 		return 1;
 
 	/* No restrictions if the parent directory is unencrypted */
-	if (!cops->is_encrypted(parent))
+	if (!IS_ENCRYPTED(parent))
 		return 1;
 
 	/* Encrypted directories must not contain unencrypted files */
-	if (!cops->is_encrypted(child))
+	if (!IS_ENCRYPTED(child))
 		return 0;
 
 	/*

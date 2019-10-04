@@ -9,6 +9,7 @@
  * 2 as published by the Free Software Foundation.
  */
 
+#include <linux/cpu.h>
 #include <linux/kernel.h>
 #include <linux/kobject.h>
 #include <linux/smp.h>
@@ -17,6 +18,7 @@
 #include <linux/device.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
+#include <linux/stringify.h>
 
 #include <asm/machdep.h>
 #include <asm/rtas.h>
@@ -343,10 +345,18 @@ void post_mobility_fixup(void)
 	if (rc)
 		printk(KERN_ERR "Post-mobility activate-fw failed: %d\n", rc);
 
+	/*
+	 * We don't want CPUs to go online/offline while the device
+	 * tree is being updated.
+	 */
+	cpus_read_lock();
+
 	rc = pseries_devicetree_update(MIGRATION_SCOPE);
 	if (rc)
 		printk(KERN_ERR "Post-mobility device tree update "
 			"failed: %d\n", rc);
+
+	cpus_read_unlock();
 
 	/* Possibly switch to a new RFI flush type */
 	pseries_setup_rfi_flush();
@@ -387,7 +397,7 @@ static ssize_t migration_store(struct class *class,
 #define MIGRATION_API_VERSION	1
 
 static CLASS_ATTR_WO(migration);
-static CLASS_ATTR_STRING(api_version, S_IRUGO, __stringify(MIGRATION_API_VERSION));
+static CLASS_ATTR_STRING(api_version, 0444, __stringify(MIGRATION_API_VERSION));
 
 static int __init mobility_sysfs_init(void)
 {

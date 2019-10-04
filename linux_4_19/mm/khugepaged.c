@@ -397,6 +397,26 @@ static inline int khugepaged_test_exit(struct mm_struct *mm)
 	return atomic_read(&mm->mm_users) == 0;
 }
 
+static bool hugepage_vma_check(struct vm_area_struct *vma,
+			       unsigned long vm_flags)
+{
+	if ((!(vm_flags & VM_HUGEPAGE) && !khugepaged_always()) ||
+	    (vm_flags & VM_NOHUGEPAGE) ||
+	    test_bit(MMF_DISABLE_THP, &vma->vm_mm->flags))
+		return false;
+	if (shmem_file(vma->vm_file)) {
+		if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE))
+			return false;
+		return IS_ALIGNED((vma->vm_start >> PAGE_SHIFT) - vma->vm_pgoff,
+				HPAGE_PMD_NR);
+	}
+	if (!vma->anon_vma || vma->vm_ops)
+		return false;
+	if (is_vma_temporary_stack(vma))
+		return false;
+	return !(vm_flags & VM_NO_KHUGEPAGED);
+}
+
 int __khugepaged_enter(struct mm_struct *mm)
 {
 	struct mm_slot *mm_slot;
@@ -434,15 +454,14 @@ int khugepaged_enter_vma_merge(struct vm_area_struct *vma,
 			       unsigned long vm_flags)
 {
 	unsigned long hstart, hend;
-	if (!vma->anon_vma)
-		/*
-		 * Not yet faulted in so we will register later in the
-		 * page fault if needed.
-		 */
+
+	/*
+	 * khugepaged does not yet work on non-shmem files or special
+	 * mappings. And file-private shmem THP is not supported.
+	 */
+	if (!hugepage_vma_check(vma, vm_flags))
 		return 0;
-	if (vma->vm_ops || (vm_flags & VM_NO_KHUGEPAGED))
-		/* khugepaged not yet working on file or special mappings */
-		return 0;
+
 	hstart = (vma->vm_start + ~HPAGE_PMD_MASK) & HPAGE_PMD_MASK;
 	hend = vma->vm_end & HPAGE_PMD_MASK;
 	if (hstart < hend)
@@ -819,25 +838,6 @@ khugepaged_alloc_page(struct page **hpage, gfp_t gfp, int node)
 }
 #endif
 
-static bool hugepage_vma_check(struct vm_area_struct *vma)
-{
-	if ((!(vma->vm_flags & VM_HUGEPAGE) && !khugepaged_always()) ||
-	    (vma->vm_flags & VM_NOHUGEPAGE) ||
-	    test_bit(MMF_DISABLE_THP, &vma->vm_mm->flags))
-		return false;
-	if (shmem_file(vma->vm_file)) {
-		if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE))
-			return false;
-		return IS_ALIGNED((vma->vm_start >> PAGE_SHIFT) - vma->vm_pgoff,
-				HPAGE_PMD_NR);
-	}
-	if (!vma->anon_vma || vma->vm_ops)
-		return false;
-	if (is_vma_temporary_stack(vma))
-		return false;
-	return !(vma->vm_flags & VM_NO_KHUGEPAGED);
-}
-
 /*
  * If mmap_sem temporarily dropped, revalidate vma
  * before taking mmap_sem.
@@ -862,7 +862,7 @@ static int hugepage_vma_revalidate(struct mm_struct *mm, unsigned long address,
 	hend = vma->vm_end & HPAGE_PMD_MASK;
 	if (address < hstart || address + HPAGE_PMD_SIZE > hend)
 		return SCAN_ADDRESS_RANGE;
-	if (!hugepage_vma_check(vma))
+	if (!hugepage_vma_check(vma, vma->vm_flags))
 		return SCAN_VMA_CHECK;
 	return 0;
 }
@@ -880,7 +880,8 @@ static bool __collapse_huge_page_swapin(struct mm_struct *mm,
 					unsigned long address, pmd_t *pmd,
 					int referenced)
 {
-	int swapped_in = 0, ret = 0;
+	int swapped_in = 0;
+	vm_fault_t ret = 0;
 	struct vm_fault vmf = {
 		.vma = vma,
 		.address = address,
@@ -965,9 +966,7 @@ static void collapse_huge_page(struct mm_struct *mm,
 		goto out_nolock;
 	}
 
-	/* Do not oom kill for khugepaged charges */
-	if (unlikely(mem_cgroup_try_charge(new_page, mm, gfp | __GFP_NORETRY,
-					   &memcg, true))) {
+	if (unlikely(mem_cgroup_try_charge(new_page, mm, gfp, &memcg, true))) {
 		result = SCAN_CGROUP_CHARGE_FAIL;
 		goto out_nolock;
 	}
@@ -1006,6 +1005,9 @@ static void collapse_huge_page(struct mm_struct *mm,
 	 * handled by the anon_vma lock + PG_lock.
 	 */
 	down_write(&mm->mmap_sem);
+	result = SCAN_ANY_PROCESS;
+	if (!mmget_still_valid(mm))
+		goto out;
 	result = hugepage_vma_revalidate(mm, address, &vma);
 	if (result)
 		goto out;
@@ -1277,7 +1279,7 @@ static void retract_page_tables(struct address_space *mapping, pgoff_t pgoff)
 			_pmd = pmdp_collapse_flush(vma, addr, pmd);
 			spin_unlock(ptl);
 			up_write(&vma->vm_mm->mmap_sem);
-			atomic_long_dec(&vma->vm_mm->nr_ptes);
+			mm_dec_nr_ptes(vma->vm_mm);
 			pte_free(vma->vm_mm, pmd_pgtable(_pmd));
 		}
 	}
@@ -1326,9 +1328,7 @@ static void collapse_shmem(struct mm_struct *mm,
 		goto out;
 	}
 
-	/* Do not oom kill for khugepaged charges */
-	if (unlikely(mem_cgroup_try_charge(new_page, mm, gfp | __GFP_NORETRY,
-					   &memcg, true))) {
+	if (unlikely(mem_cgroup_try_charge(new_page, mm, gfp, &memcg, true))) {
 		result = SCAN_CGROUP_CHARGE_FAIL;
 		goto out;
 	}
@@ -1345,8 +1345,8 @@ static void collapse_shmem(struct mm_struct *mm,
 	 */
 
 	index = start;
-	spin_lock_irq(&mapping->tree_lock);
-	radix_tree_for_each_slot(slot, &mapping->page_tree, &iter, start) {
+	xa_lock_irq(&mapping->i_pages);
+	radix_tree_for_each_slot(slot, &mapping->i_pages, &iter, start) {
 		int n = min(iter.index, end) - index;
 
 		/*
@@ -1368,7 +1368,7 @@ static void collapse_shmem(struct mm_struct *mm,
 			goto tree_locked;
 		}
 		for (; index < min(iter.index, end); index++) {
-			radix_tree_insert(&mapping->page_tree, index,
+			radix_tree_insert(&mapping->i_pages, index,
 					new_page + (index % HPAGE_PMD_NR));
 		}
 		nr_none += n;
@@ -1378,9 +1378,9 @@ static void collapse_shmem(struct mm_struct *mm,
 			break;
 
 		page = radix_tree_deref_slot_protected(slot,
-				&mapping->tree_lock);
+				&mapping->i_pages.xa_lock);
 		if (radix_tree_exceptional_entry(page) || !PageUptodate(page)) {
-			spin_unlock_irq(&mapping->tree_lock);
+			xa_unlock_irq(&mapping->i_pages);
 			/* swap in or instantiate fallocated page */
 			if (shmem_getpage(mapping->host, index, &page,
 						SGP_NOHUGE)) {
@@ -1389,14 +1389,14 @@ static void collapse_shmem(struct mm_struct *mm,
 			}
 		} else if (trylock_page(page)) {
 			get_page(page);
-			spin_unlock_irq(&mapping->tree_lock);
+			xa_unlock_irq(&mapping->i_pages);
 		} else {
 			result = SCAN_PAGE_LOCK;
 			goto tree_locked;
 		}
 
 		/*
-		 * The page must be locked, so we can drop the tree_lock
+		 * The page must be locked, so we can drop the i_pages lock
 		 * without racing with truncate.
 		 */
 		VM_BUG_ON_PAGE(!PageLocked(page), page);
@@ -1422,14 +1422,13 @@ static void collapse_shmem(struct mm_struct *mm,
 		}
 
 		if (page_mapped(page))
-			unmap_mapping_range(mapping, index << PAGE_SHIFT,
-					PAGE_SIZE, 0);
+			unmap_mapping_pages(mapping, index, 1, false);
 
-		spin_lock_irq(&mapping->tree_lock);
+		xa_lock_irq(&mapping->i_pages);
 
-		slot = radix_tree_lookup_slot(&mapping->page_tree, index);
+		slot = radix_tree_lookup_slot(&mapping->i_pages, index);
 		VM_BUG_ON_PAGE(page != radix_tree_deref_slot_protected(slot,
-					&mapping->tree_lock), page);
+					&mapping->i_pages.xa_lock), page);
 		VM_BUG_ON_PAGE(page_mapped(page), page);
 
 		/*
@@ -1440,7 +1439,7 @@ static void collapse_shmem(struct mm_struct *mm,
 		 */
 		if (!page_ref_freeze(page, 3)) {
 			result = SCAN_PAGE_COUNT;
-			spin_unlock_irq(&mapping->tree_lock);
+			xa_unlock_irq(&mapping->i_pages);
 			putback_lru_page(page);
 			goto out_unlock;
 		}
@@ -1452,7 +1451,7 @@ static void collapse_shmem(struct mm_struct *mm,
 		list_add_tail(&page->lru, &pagelist);
 
 		/* Finally, replace with the new page. */
-		radix_tree_replace_slot(&mapping->page_tree, slot,
+		radix_tree_replace_slot(&mapping->i_pages, slot,
 				new_page + (index % HPAGE_PMD_NR));
 
 		slot = radix_tree_iter_resume(slot, &iter);
@@ -1482,7 +1481,7 @@ out_unlock:
 			goto tree_locked;
 		}
 		for (; index < end; index++) {
-			radix_tree_insert(&mapping->page_tree, index,
+			radix_tree_insert(&mapping->i_pages, index,
 					new_page + (index % HPAGE_PMD_NR));
 		}
 		nr_none += n;
@@ -1497,7 +1496,7 @@ out_unlock:
 	}
 
 tree_locked:
-	spin_unlock_irq(&mapping->tree_lock);
+	xa_unlock_irq(&mapping->i_pages);
 tree_unlocked:
 
 	if (result == SCAN_SUCCEED) {
@@ -1538,14 +1537,15 @@ tree_unlocked:
 		 */
 		retract_page_tables(mapping, start);
 		*hpage = NULL;
+
+		khugepaged_pages_collapsed++;
 	} else {
 		/* Something went wrong: rollback changes to the radix-tree */
-		spin_lock_irq(&mapping->tree_lock);
+		xa_lock_irq(&mapping->i_pages);
 		mapping->nrpages -= nr_none;
 		shmem_uncharge(mapping->host, nr_none);
 
-		radix_tree_for_each_slot(slot, &mapping->page_tree, &iter,
-				start) {
+		radix_tree_for_each_slot(slot, &mapping->i_pages, &iter, start) {
 			if (iter.index >= end)
 				break;
 			page = list_first_entry_or_null(&pagelist,
@@ -1555,8 +1555,7 @@ tree_unlocked:
 					break;
 				nr_none--;
 				/* Put holes back where they were */
-				radix_tree_delete(&mapping->page_tree,
-						  iter.index);
+				radix_tree_delete(&mapping->i_pages, iter.index);
 				continue;
 			}
 
@@ -1565,16 +1564,15 @@ tree_unlocked:
 			/* Unfreeze the page. */
 			list_del(&page->lru);
 			page_ref_unfreeze(page, 2);
-			radix_tree_replace_slot(&mapping->page_tree,
-						slot, page);
+			radix_tree_replace_slot(&mapping->i_pages, slot, page);
 			slot = radix_tree_iter_resume(slot, &iter);
-			spin_unlock_irq(&mapping->tree_lock);
+			xa_unlock_irq(&mapping->i_pages);
 			unlock_page(page);
 			putback_lru_page(page);
-			spin_lock_irq(&mapping->tree_lock);
+			xa_lock_irq(&mapping->i_pages);
 		}
 		VM_BUG_ON(nr_none);
-		spin_unlock_irq(&mapping->tree_lock);
+		xa_unlock_irq(&mapping->i_pages);
 
 		mem_cgroup_cancel_charge(new_page, memcg, true);
 		new_page->mapping = NULL;
@@ -1601,7 +1599,7 @@ static void khugepaged_scan_shmem(struct mm_struct *mm,
 	swap = 0;
 	memset(khugepaged_node_load, 0, sizeof(khugepaged_node_load));
 	rcu_read_lock();
-	radix_tree_for_each_slot(slot, &mapping->page_tree, &iter, start) {
+	radix_tree_for_each_slot(slot, &mapping->i_pages, &iter, start) {
 		if (iter.index >= start + HPAGE_PMD_NR)
 			break;
 
@@ -1719,7 +1717,7 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages,
 			progress++;
 			break;
 		}
-		if (!hugepage_vma_check(vma)) {
+		if (!hugepage_vma_check(vma, vma->vm_flags)) {
 skip:
 			progress++;
 			continue;
@@ -1901,8 +1899,16 @@ static void set_recommended_min_free_kbytes(void)
 	int nr_zones = 0;
 	unsigned long recommended_min;
 
-	for_each_populated_zone(zone)
+	for_each_populated_zone(zone) {
+		/*
+		 * We don't need to worry about fragmentation of
+		 * ZONE_MOVABLE since it only has movable pages.
+		 */
+		if (zone_idx(zone) > gfp_zone(GFP_USER))
+			continue;
+
 		nr_zones++;
+	}
 
 	/* Ensure 2 pageblocks are free to assist fragmentation avoidance */
 	recommended_min = pageblock_nr_pages * nr_zones * 2;

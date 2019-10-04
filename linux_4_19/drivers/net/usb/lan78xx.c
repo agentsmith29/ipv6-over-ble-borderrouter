@@ -44,7 +44,6 @@
 #define DRIVER_AUTHOR	"WOOJUNG HUH <woojung.huh@microchip.com>"
 #define DRIVER_DESC	"LAN78XX USB 3.0 Gigabit Ethernet Devices"
 #define DRIVER_NAME	"lan78xx"
-#define DRIVER_VERSION	"1.0.6"
 
 #define TX_TIMEOUT_JIFFIES		(5 * HZ)
 #define THROTTLE_JIFFIES		(HZ / 8)
@@ -280,6 +279,30 @@ struct lan78xx_statstage64 {
 	u64 eee_tx_lpi_transitions;
 	u64 eee_tx_lpi_time;
 };
+
+static u32 lan78xx_regs[] = {
+	ID_REV,
+	INT_STS,
+	HW_CFG,
+	PMT_CTL,
+	E2P_CMD,
+	E2P_DATA,
+	USB_STATUS,
+	VLAN_TYPE,
+	MAC_CR,
+	MAC_RX,
+	MAC_TX,
+	FLOW,
+	ERR_STS,
+	MII_ACC,
+	MII_DATA,
+	EEE_TX_LPI_REQ_DLY,
+	EEE_TW_TX_SYS,
+	EEE_TX_LPI_REM_DLY,
+	WUCSR
+};
+
+#define PHY_REG_SIZE (32 * sizeof(u32))
 
 struct lan78xx_net;
 
@@ -1487,7 +1510,6 @@ static void lan78xx_get_drvinfo(struct net_device *net,
 	struct lan78xx_net *dev = netdev_priv(net);
 
 	strncpy(info->driver, DRIVER_NAME, sizeof(info->driver));
-	strncpy(info->version, DRIVER_VERSION, sizeof(info->version));
 	usb_make_path(dev->udev, info->bus_info, sizeof(info->bus_info));
 }
 
@@ -1615,6 +1637,34 @@ exit:
 	return ret;
 }
 
+static int lan78xx_get_regs_len(struct net_device *netdev)
+{
+	if (!netdev->phydev)
+		return (sizeof(lan78xx_regs));
+	else
+		return (sizeof(lan78xx_regs) + PHY_REG_SIZE);
+}
+
+static void
+lan78xx_get_regs(struct net_device *netdev, struct ethtool_regs *regs,
+		 void *buf)
+{
+	u32 *data = buf;
+	int i, j;
+	struct lan78xx_net *dev = netdev_priv(netdev);
+
+	/* Read Device/MAC registers */
+	for (i = 0; i < ARRAY_SIZE(lan78xx_regs); i++)
+		lan78xx_read_reg(dev, lan78xx_regs[i], &data[i]);
+
+	if (!netdev->phydev)
+		return;
+
+	/* Read PHY registers */
+	for (j = 0; j < 32; i++, j++)
+		data[i] = phy_read(netdev->phydev, j);
+}
+
 static const struct ethtool_ops lan78xx_ethtool_ops = {
 	.get_link	= lan78xx_get_link,
 	.nway_reset	= phy_ethtool_nway_reset,
@@ -1635,6 +1685,8 @@ static const struct ethtool_ops lan78xx_ethtool_ops = {
 	.set_pauseparam	= lan78xx_set_pause,
 	.get_link_ksettings = lan78xx_get_link_ksettings,
 	.set_link_ksettings = lan78xx_set_link_ksettings,
+	.get_regs_len	= lan78xx_get_regs_len,
+	.get_regs	= lan78xx_get_regs,
 };
 
 static int lan78xx_ioctl(struct net_device *netdev, struct ifreq *rq, int cmd)
@@ -1676,7 +1728,7 @@ static void lan78xx_init_mac_address(struct lan78xx_net *dev)
 				  "MAC address read from EEPROM");
 		} else {
 			/* generate random MAC */
-			random_ether_addr(addr);
+			eth_random_addr(addr);
 			netif_dbg(dev, ifup, dev->net,
 				  "MAC address set to random addr");
 		}
@@ -1800,7 +1852,8 @@ static int lan78xx_mdio_init(struct lan78xx_net *dev)
 
 	node = of_get_child_by_name(dev->udev->dev.of_node, "mdio");
 	ret = of_mdiobus_register(dev->mdiobus, node);
-	of_node_put(node);
+	if (node)
+		of_node_put(node);
 	if (ret) {
 		netdev_err(dev->net, "can't register MDIO bus\n");
 		goto exit1;
@@ -2013,55 +2066,91 @@ static int ksz9031rnx_fixup(struct phy_device *phydev)
 	return 1;
 }
 
-static int lan78xx_phy_init(struct lan78xx_net *dev)
+static struct phy_device *lan7801_phy_init(struct lan78xx_net *dev)
 {
+	u32 buf;
 	int ret;
-	u32 mii_adv;
-	u32 led_modes[2];
-	u32 led_modes_reg;
-	int i;
-	struct phy_device *phydev = dev->net->phydev;
+	struct fixed_phy_status fphy_status = {
+		.link = 1,
+		.speed = SPEED_1000,
+		.duplex = DUPLEX_FULL,
+	};
+	struct phy_device *phydev;
 
 	phydev = phy_find_first(dev->mdiobus);
 	if (!phydev) {
-		netdev_err(dev->net, "no PHY found\n");
-		return -EIO;
-	}
-
-	if ((dev->chipid == ID_REV_CHIP_ID_7800_) ||
-	    (dev->chipid == ID_REV_CHIP_ID_7850_)) {
-		phydev->is_internal = true;
-		dev->interface = PHY_INTERFACE_MODE_GMII;
-
-	} else if (dev->chipid == ID_REV_CHIP_ID_7801_) {
+		netdev_dbg(dev->net, "PHY Not Found!! Registering Fixed PHY\n");
+		phydev = fixed_phy_register(PHY_POLL, &fphy_status, -1,
+					    NULL);
+		if (IS_ERR(phydev)) {
+			netdev_err(dev->net, "No PHY/fixed_PHY found\n");
+			return NULL;
+		}
+		netdev_dbg(dev->net, "Registered FIXED PHY\n");
+		dev->interface = PHY_INTERFACE_MODE_RGMII;
+		ret = lan78xx_write_reg(dev, MAC_RGMII_ID,
+					MAC_RGMII_ID_TXC_DELAY_EN_);
+		ret = lan78xx_write_reg(dev, RGMII_TX_BYP_DLL, 0x3D00);
+		ret = lan78xx_read_reg(dev, HW_CFG, &buf);
+		buf |= HW_CFG_CLK125_EN_;
+		buf |= HW_CFG_REFCLK25_EN_;
+		ret = lan78xx_write_reg(dev, HW_CFG, buf);
+	} else {
 		if (!phydev->drv) {
 			netdev_err(dev->net, "no PHY driver found\n");
-			return -EIO;
+			return NULL;
 		}
-
 		dev->interface = PHY_INTERFACE_MODE_RGMII;
-
 		/* external PHY fixup for KSZ9031RNX */
 		ret = phy_register_fixup_for_uid(PHY_KSZ9031RNX, 0xfffffff0,
 						 ksz9031rnx_fixup);
 		if (ret < 0) {
-			netdev_err(dev->net, "fail to register fixup\n");
-			return ret;
+			netdev_err(dev->net, "Failed to register fixup for PHY_KSZ9031RNX\n");
+			return NULL;
 		}
 		/* external PHY fixup for LAN8835 */
 		ret = phy_register_fixup_for_uid(PHY_LAN8835, 0xfffffff0,
 						 lan8835_fixup);
 		if (ret < 0) {
-			netdev_err(dev->net, "fail to register fixup\n");
-			return ret;
+			netdev_err(dev->net, "Failed to register fixup for PHY_LAN8835\n");
+			return NULL;
 		}
 		/* add more external PHY fixup here if needed */
 
 		phydev->is_internal = false;
-	} else {
-		netdev_err(dev->net, "unknown ID found\n");
-		ret = -EIO;
-		goto error;
+	}
+	return phydev;
+}
+
+static int lan78xx_phy_init(struct lan78xx_net *dev)
+{
+	int ret;
+	u32 mii_adv;
+	struct phy_device *phydev;
+
+	switch (dev->chipid) {
+	case ID_REV_CHIP_ID_7801_:
+		phydev = lan7801_phy_init(dev);
+		if (!phydev) {
+			netdev_err(dev->net, "lan7801: PHY Init Failed");
+			return -EIO;
+		}
+		break;
+
+	case ID_REV_CHIP_ID_7800_:
+	case ID_REV_CHIP_ID_7850_:
+		phydev = phy_find_first(dev->mdiobus);
+		if (!phydev) {
+			netdev_err(dev->net, "no PHY found\n");
+			return -EIO;
+		}
+		phydev->is_internal = true;
+		dev->interface = PHY_INTERFACE_MODE_GMII;
+		break;
+
+	default:
+		netdev_err(dev->net, "Unknown CHIP ID found\n");
+		return -EIO;
 	}
 
 	/* if phyirq is not set, use polling mode in phylib */
@@ -2080,6 +2169,16 @@ static int lan78xx_phy_init(struct lan78xx_net *dev)
 	if (ret) {
 		netdev_err(dev->net, "can't attach PHY to %s\n",
 			   dev->mdiobus->id);
+		if (dev->chipid == ID_REV_CHIP_ID_7801_) {
+			if (phy_is_pseudo_fixed_link(phydev)) {
+				fixed_phy_unregister(phydev);
+			} else {
+				phy_unregister_fixup_for_uid(PHY_KSZ9031RNX,
+							     0xfffffff0);
+				phy_unregister_fixup_for_uid(PHY_LAN8835,
+							     0xfffffff0);
+			}
+		}
 		return -EIO;
 	}
 
@@ -2092,7 +2191,7 @@ static int lan78xx_phy_init(struct lan78xx_net *dev)
 	mii_adv = (u32)mii_advertise_flowctrl(dev->fc_request_control);
 	phydev->advertising |= mii_adv_to_ethtool_adv_t(mii_adv);
 
-	if (of_property_read_bool(dev->udev->dev.of_node,
+	if (of_property_read_bool(phydev->mdio.dev.of_node,
 				  "microchip,eee-enabled")) {
 		struct ethtool_eee edata;
 		memset(&edata, 0, sizeof(edata));
@@ -2108,39 +2207,33 @@ static int lan78xx_phy_init(struct lan78xx_net *dev)
 		(void)lan78xx_set_eee(dev->net, &edata);
 	}
 
-	/* Set LED modes:
-	 * led: 0=link/activity          1=link1000/activity
-	 *      2=link100/activity       3=link10/activity
-	 *      4=link100/1000/activity  5=link10/1000/activity
-	 *      6=link10/100/activity    14=off    15=on
-	 */
+	if (phydev->mdio.dev.of_node) {
+		u32 reg;
+		int len;
 
-	memset(led_modes, ~0, sizeof(led_modes));
-
-	of_property_read_u32_array(dev->udev->dev.of_node,
-				   "microchip,led-modes",
-				   led_modes, ARRAY_SIZE(led_modes));
-
-	led_modes_reg = phy_read(phydev, 0x1d);
-	for (i = 0; i < ARRAY_SIZE(led_modes); i++) {
-		if (led_modes[i] != ~0) {
-			led_modes_reg &= ~(0xf << (i * 4));
-			led_modes_reg |= (led_modes[i] & 0xf) << (i * 4);
+		len = of_property_count_elems_of_size(phydev->mdio.dev.of_node,
+						      "microchip,led-modes",
+						      sizeof(u32));
+		if (len >= 0) {
+			/* Ensure the appropriate LEDs are enabled */
+			lan78xx_read_reg(dev, HW_CFG, &reg);
+			reg &= ~(HW_CFG_LED0_EN_ |
+				 HW_CFG_LED1_EN_ |
+				 HW_CFG_LED2_EN_ |
+				 HW_CFG_LED3_EN_);
+			reg |= (len > 0) * HW_CFG_LED0_EN_ |
+				(len > 1) * HW_CFG_LED1_EN_ |
+				(len > 2) * HW_CFG_LED2_EN_ |
+				(len > 3) * HW_CFG_LED3_EN_;
+			lan78xx_write_reg(dev, HW_CFG, reg);
 		}
 	}
-	(void)phy_write(phydev, 0x1d, led_modes_reg);
 
 	genphy_config_aneg(phydev);
 
 	dev->fc_autoneg = phydev->autoneg;
 
 	return 0;
-
-error:
-	phy_unregister_fixup_for_uid(PHY_KSZ9031RNX, 0xfffffff0);
-	phy_unregister_fixup_for_uid(PHY_LAN8835, 0xfffffff0);
-
-	return ret;
 }
 
 static int lan78xx_set_rx_max_frame_length(struct lan78xx_net *dev, int size)
@@ -2408,6 +2501,7 @@ static int lan78xx_reset(struct lan78xx_net *dev)
 	u32 buf;
 	int ret = 0;
 	unsigned long timeout;
+	u8 sig;
 	bool has_eeprom;
 	bool has_otp;
 
@@ -2515,6 +2609,15 @@ static int lan78xx_reset(struct lan78xx_net *dev)
 	/* LAN7801 only has RGMII mode */
 	if (dev->chipid == ID_REV_CHIP_ID_7801_)
 		buf &= ~MAC_CR_GMII_EN_;
+
+	if (dev->chipid == ID_REV_CHIP_ID_7800_) {
+		ret = lan78xx_read_raw_eeprom(dev, 0, 1, &sig);
+		if (!ret && sig != EEPROM_INDICATOR) {
+			/* Implies there is no external eeprom. Set mac speed */
+			netdev_info(dev->net, "No External EEPROM. Setting MAC Speed\n");
+			buf |= MAC_CR_AUTO_DUPLEX_ | MAC_CR_AUTO_SPEED_;
+		}
+	}
 	/* If no valid EEPROM and no valid OTP, enable AUTO negotiation */
 	if (!has_eeprom && !has_otp)
 	    buf |= MAC_CR_AUTO_DUPLEX_ | MAC_CR_AUTO_SPEED_;
@@ -2994,7 +3097,7 @@ static void lan78xx_rx_csum_offload(struct lan78xx_net *dev,
 				    u32 rx_cmd_a, u32 rx_cmd_b)
 {
 	/* HW Checksum offload appears to be flawed if used when not stripping
-	 * VLAN headers.
+	 * VLAN headers. Drop back to S/W checksums under these conditions.
 	 */
 	if (!(dev->net->features & NETIF_F_RXCSUM) ||
 	    unlikely(rx_cmd_a & RX_CMD_A_ICSM_) ||
@@ -3147,7 +3250,7 @@ static int rx_submit(struct lan78xx_net *dev, struct urb *urb, gfp_t flags)
 	size_t size = dev->rx_urb_size;
 	int ret = 0;
 
-	skb = netdev_alloc_skb_ip_align(dev->net, size);
+	skb = netdev_alloc_skb(dev->net, size);
 	if (!skb) {
 		usb_free_urb(urb);
 		return -ENOMEM;
@@ -3582,6 +3685,7 @@ static void lan78xx_disconnect(struct usb_interface *intf)
 	struct lan78xx_net		*dev;
 	struct usb_device		*udev;
 	struct net_device		*net;
+	struct phy_device		*phydev;
 
 	dev = usb_get_intfdata(intf);
 	usb_set_intfdata(intf, NULL);
@@ -3590,11 +3694,15 @@ static void lan78xx_disconnect(struct usb_interface *intf)
 
 	udev = interface_to_usbdev(intf);
 	net = dev->net;
+	phydev = net->phydev;
 
 	phy_unregister_fixup_for_uid(PHY_KSZ9031RNX, 0xfffffff0);
 	phy_unregister_fixup_for_uid(PHY_LAN8835, 0xfffffff0);
 
 	phy_disconnect(net->phydev);
+
+	if (phy_is_pseudo_fixed_link(phydev))
+		fixed_phy_unregister(phydev);
 
 	unregister_netdev(net);
 
@@ -3634,11 +3742,9 @@ static const struct net_device_ops lan78xx_netdev_ops = {
 	.ndo_vlan_rx_kill_vid	= lan78xx_vlan_rx_kill_vid,
 };
 
-static void lan78xx_stat_monitor(unsigned long param)
+static void lan78xx_stat_monitor(struct timer_list *t)
 {
-	struct lan78xx_net *dev;
-
-	dev = (struct lan78xx_net *)param;
+	struct lan78xx_net *dev = from_timer(dev, t, stat_monitor);
 
 	lan78xx_defer_kevent(dev, EVENT_STAT_UPDATE);
 }
@@ -3689,10 +3795,8 @@ static int lan78xx_probe(struct usb_interface *intf,
 	netdev->watchdog_timeo = TX_TIMEOUT_JIFFIES;
 	netdev->ethtool_ops = &lan78xx_ethtool_ops;
 
-	dev->stat_monitor.function = lan78xx_stat_monitor;
-	dev->stat_monitor.data = (unsigned long)dev;
 	dev->delta = 1;
-	init_timer(&dev->stat_monitor);
+	timer_setup(&dev->stat_monitor, lan78xx_stat_monitor, 0);
 
 	mutex_init(&dev->stats.access_lock);
 
@@ -3747,7 +3851,7 @@ static int lan78xx_probe(struct usb_interface *intf,
 	ret = register_netdev(netdev);
 	if (ret != 0) {
 		netif_err(dev, probe, netdev, "couldn't register the device\n");
-		goto out3;
+		goto out4;
 	}
 
 	usb_set_intfdata(intf, dev);
@@ -3762,12 +3866,14 @@ static int lan78xx_probe(struct usb_interface *intf,
 
 	ret = lan78xx_phy_init(dev);
 	if (ret < 0)
-		goto out4;
+		goto out5;
 
 	return 0;
 
-out4:
+out5:
 	unregister_netdev(netdev);
+out4:
+	usb_free_urb(dev->urb_intr);
 out3:
 	lan78xx_unbind(dev, intf);
 out2:

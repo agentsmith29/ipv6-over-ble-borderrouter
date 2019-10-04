@@ -913,9 +913,8 @@ static __cpuidle int intel_idle(struct cpuidle_device *dev,
 	struct cpuidle_state *state = &drv->states[index];
 	unsigned long eax = flg2MWAIT(state->flags);
 	unsigned int cstate;
+	bool uninitialized_var(tick);
 	int cpu = smp_processor_id();
-
-	cstate = (((eax) >> MWAIT_SUBSTATE_SIZE) & MWAIT_CSTATE_MASK) + 1;
 
 	/*
 	 * leave_mm() to avoid costly and often unnecessary wakeups
@@ -924,12 +923,19 @@ static __cpuidle int intel_idle(struct cpuidle_device *dev,
 	if (state->flags & CPUIDLE_FLAG_TLB_FLUSHED)
 		leave_mm(cpu);
 
-	if (!(lapic_timer_reliable_states & (1 << (cstate))))
-		tick_broadcast_enter();
+	if (!static_cpu_has(X86_FEATURE_ARAT)) {
+		cstate = (((eax) >> MWAIT_SUBSTATE_SIZE) &
+				MWAIT_CSTATE_MASK) + 1;
+		tick = false;
+		if (!(lapic_timer_reliable_states & (1 << (cstate)))) {
+			tick = true;
+			tick_broadcast_enter();
+		}
+	}
 
 	mwait_idle_with_hints(eax, ecx);
 
-	if (!(lapic_timer_reliable_states & (1 << (cstate))))
+	if (!static_cpu_has(X86_FEATURE_ARAT) && tick)
 		tick_broadcast_exit();
 
 	return index;
@@ -1070,14 +1076,14 @@ static const struct x86_cpu_id intel_idle_ids[] __initconst = {
 	ICPU(INTEL_FAM6_WESTMERE,		idle_cpu_nehalem),
 	ICPU(INTEL_FAM6_WESTMERE_EP,		idle_cpu_nehalem),
 	ICPU(INTEL_FAM6_NEHALEM_EX,		idle_cpu_nehalem),
-	ICPU(INTEL_FAM6_ATOM_PINEVIEW,		idle_cpu_atom),
-	ICPU(INTEL_FAM6_ATOM_LINCROFT,		idle_cpu_lincroft),
+	ICPU(INTEL_FAM6_ATOM_BONNELL,		idle_cpu_atom),
+	ICPU(INTEL_FAM6_ATOM_BONNELL_MID,		idle_cpu_lincroft),
 	ICPU(INTEL_FAM6_WESTMERE_EX,		idle_cpu_nehalem),
 	ICPU(INTEL_FAM6_SANDYBRIDGE,		idle_cpu_snb),
 	ICPU(INTEL_FAM6_SANDYBRIDGE_X,		idle_cpu_snb),
-	ICPU(INTEL_FAM6_ATOM_CEDARVIEW,		idle_cpu_atom),
-	ICPU(INTEL_FAM6_ATOM_SILVERMONT1,	idle_cpu_byt),
-	ICPU(INTEL_FAM6_ATOM_MERRIFIELD,	idle_cpu_tangier),
+	ICPU(INTEL_FAM6_ATOM_SALTWELL,		idle_cpu_atom),
+	ICPU(INTEL_FAM6_ATOM_SILVERMONT,	idle_cpu_byt),
+	ICPU(INTEL_FAM6_ATOM_SILVERMONT_MID,	idle_cpu_tangier),
 	ICPU(INTEL_FAM6_ATOM_AIRMONT,		idle_cpu_cht),
 	ICPU(INTEL_FAM6_IVYBRIDGE,		idle_cpu_ivb),
 	ICPU(INTEL_FAM6_IVYBRIDGE_X,		idle_cpu_ivt),
@@ -1085,7 +1091,7 @@ static const struct x86_cpu_id intel_idle_ids[] __initconst = {
 	ICPU(INTEL_FAM6_HASWELL_X,		idle_cpu_hsw),
 	ICPU(INTEL_FAM6_HASWELL_ULT,		idle_cpu_hsw),
 	ICPU(INTEL_FAM6_HASWELL_GT3E,		idle_cpu_hsw),
-	ICPU(INTEL_FAM6_ATOM_SILVERMONT2,	idle_cpu_avn),
+	ICPU(INTEL_FAM6_ATOM_SILVERMONT_X,	idle_cpu_avn),
 	ICPU(INTEL_FAM6_BROADWELL_CORE,		idle_cpu_bdw),
 	ICPU(INTEL_FAM6_BROADWELL_GT3E,		idle_cpu_bdw),
 	ICPU(INTEL_FAM6_BROADWELL_X,		idle_cpu_bdw),
@@ -1098,8 +1104,8 @@ static const struct x86_cpu_id intel_idle_ids[] __initconst = {
 	ICPU(INTEL_FAM6_XEON_PHI_KNL,		idle_cpu_knl),
 	ICPU(INTEL_FAM6_XEON_PHI_KNM,		idle_cpu_knl),
 	ICPU(INTEL_FAM6_ATOM_GOLDMONT,		idle_cpu_bxt),
-	ICPU(INTEL_FAM6_ATOM_GEMINI_LAKE,	idle_cpu_bxt),
-	ICPU(INTEL_FAM6_ATOM_DENVERTON,		idle_cpu_dnv),
+	ICPU(INTEL_FAM6_ATOM_GOLDMONT_PLUS,	idle_cpu_bxt),
+	ICPU(INTEL_FAM6_ATOM_GOLDMONT_X,	idle_cpu_dnv),
 	{}
 };
 
@@ -1316,7 +1322,7 @@ static void intel_idle_state_table_update(void)
 		ivt_idle_state_table_update();
 		break;
 	case INTEL_FAM6_ATOM_GOLDMONT:
-	case INTEL_FAM6_ATOM_GEMINI_LAKE:
+	case INTEL_FAM6_ATOM_GOLDMONT_PLUS:
 		bxt_idle_state_table_update();
 		break;
 	case INTEL_FAM6_SKYLAKE_DESKTOP:

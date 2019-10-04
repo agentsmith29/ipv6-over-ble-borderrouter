@@ -20,6 +20,7 @@
 #include <linux/security.h>
 #include <linux/user_namespace.h>
 #include <linux/uaccess.h>
+#include <keys/request_key_auth-type.h>
 #include "internal.h"
 
 /* Session keyring create vs join semaphore */
@@ -738,7 +739,7 @@ try_again:
 	if (ret < 0)
 		goto invalid_key;
 
-	key->last_used_at = current_kernel_time().tv_sec;
+	key->last_used_at = ktime_get_real_seconds();
 
 error:
 	put_cred(ctx.cred);

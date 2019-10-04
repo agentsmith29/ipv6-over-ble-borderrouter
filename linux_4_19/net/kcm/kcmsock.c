@@ -396,8 +396,8 @@ static int kcm_read_sock_done(struct strparser *strp, int err)
 
 static void psock_state_change(struct sock *sk)
 {
-	/* TCP only does a POLLIN for a half close. Do a POLLHUP here
-	 * since application will normally not poll with POLLIN
+	/* TCP only does a EPOLLIN for a half close. Do a EPOLLHUP here
+	 * since application will normally not poll with EPOLLIN
 	 * on the TCP sockets.
 	 */
 
@@ -1338,7 +1338,7 @@ static void init_kcm_sock(struct kcm_sock *kcm, struct kcm_mux *mux)
 
 	/* For SOCK_SEQPACKET sock type, datagram_poll checks the sk_state, so
 	 * we set sk_state, otherwise epoll_wait always returns right away with
-	 * POLLHUP
+	 * EPOLLHUP
 	 */
 	kcm->sk.sk_state = TCP_ESTABLISHED;
 
@@ -1660,7 +1660,6 @@ static struct file *kcm_clone(struct socket *osock)
 {
 	struct socket *newsock;
 	struct sock *newsk;
-	struct file *file;
 
 	newsock = sock_alloc();
 	if (!newsock)
@@ -1680,11 +1679,7 @@ static struct file *kcm_clone(struct socket *osock)
 	sock_init_data(newsock, newsk);
 	init_kcm_sock(kcm_sk(newsk), kcm_sk(osock->sk)->mux);
 
-	file = sock_alloc_file(newsock, 0, osock->sk->sk_prot_creator->name);
-	if (IS_ERR(file))
-		sock_release(newsock);
-
-	return file;
+	return sock_alloc_file(newsock, 0, osock->sk->sk_prot_creator->name);
 }
 
 static int kcm_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
@@ -2059,13 +2054,13 @@ static int __init kcm_init(void)
 	if (err)
 		goto fail;
 
-	err = sock_register(&kcm_family_ops);
-	if (err)
-		goto sock_register_fail;
-
 	err = register_pernet_device(&kcm_net_ops);
 	if (err)
 		goto net_ops_fail;
+
+	err = sock_register(&kcm_family_ops);
+	if (err)
+		goto sock_register_fail;
 
 	err = kcm_proc_init();
 	if (err)
@@ -2074,12 +2069,12 @@ static int __init kcm_init(void)
 	return 0;
 
 proc_init_fail:
-	unregister_pernet_device(&kcm_net_ops);
-
-net_ops_fail:
 	sock_unregister(PF_KCM);
 
 sock_register_fail:
+	unregister_pernet_device(&kcm_net_ops);
+
+net_ops_fail:
 	proto_unregister(&kcm_proto);
 
 fail:
@@ -2095,8 +2090,8 @@ fail:
 static void __exit kcm_exit(void)
 {
 	kcm_proc_exit();
-	unregister_pernet_device(&kcm_net_ops);
 	sock_unregister(PF_KCM);
+	unregister_pernet_device(&kcm_net_ops);
 	proto_unregister(&kcm_proto);
 	destroy_workqueue(kcm_wq);
 
@@ -2109,4 +2104,3 @@ module_exit(kcm_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_ALIAS_NETPROTO(PF_KCM);
-

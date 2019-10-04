@@ -2855,7 +2855,7 @@ irq_notforus:
  */
 
 static void
-hfcmulti_dbusy_timer(struct hfc_multi *hc)
+hfcmulti_dbusy_timer(struct timer_list *t)
 {
 }
 
@@ -3877,8 +3877,7 @@ hfcmulti_initmode(struct dchannel *dch)
 		if (hc->dnum[pt]) {
 			mode_hfcmulti(hc, dch->slot, dch->dev.D.protocol,
 				      -1, 0, -1, 0);
-			setup_timer(&dch->timer, (void *)hfcmulti_dbusy_timer,
-				    (long)dch);
+			timer_setup(&dch->timer, hfcmulti_dbusy_timer, 0);
 		}
 		for (i = 1; i <= 31; i++) {
 			if (!((1 << i) & hc->bmask[pt])) /* skip unused chan */
@@ -3984,8 +3983,7 @@ hfcmulti_initmode(struct dchannel *dch)
 		hc->chan[i].slot_rx = -1;
 		hc->chan[i].conf = -1;
 		mode_hfcmulti(hc, i, dch->dev.D.protocol, -1, 0, -1, 0);
-		setup_timer(&dch->timer, (void *)hfcmulti_dbusy_timer,
-			    (long)dch);
+		timer_setup(&dch->timer, hfcmulti_dbusy_timer, 0);
 		hc->chan[i - 2].slot_tx = -1;
 		hc->chan[i - 2].slot_rx = -1;
 		hc->chan[i - 2].conf = -1;
@@ -4367,7 +4365,8 @@ setup_pci(struct hfc_multi *hc, struct pci_dev *pdev,
 	if (m->clock2)
 		test_and_set_bit(HFC_CHIP_CLOCK2, &hc->chip);
 
-	if (ent->device == 0xB410) {
+	if (ent->vendor == PCI_VENDOR_ID_DIGIUM &&
+	    ent->device == PCI_DEVICE_ID_DIGIUM_HFC4S) {
 		test_and_set_bit(HFC_CHIP_B410P, &hc->chip);
 		test_and_set_bit(HFC_CHIP_PCM_MASTER, &hc->chip);
 		test_and_clear_bit(HFC_CHIP_PCM_SLAVE, &hc->chip);

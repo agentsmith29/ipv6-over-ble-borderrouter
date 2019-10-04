@@ -76,14 +76,9 @@
 
 /*
  * Modules' sections will be aligned on page boundaries
- * to ensure complete separation of code and data, but
- * only when CONFIG_STRICT_MODULE_RWX=y
+ * to ensure complete separation of code and data
  */
-#ifdef CONFIG_STRICT_MODULE_RWX
 # define debug_align(X) ALIGN(X, PAGE_SIZE)
-#else
-# define debug_align(X) (X)
-#endif
 
 /* If this is set, the section belongs in the init part of the module */
 #define INIT_OFFSET_MASK (1UL << (BITS_PER_LONG-1))
@@ -274,9 +269,17 @@ static void module_assert_mutex_or_preempt(void)
 }
 
 static bool sig_enforce = IS_ENABLED(CONFIG_MODULE_SIG_FORCE);
-#ifndef CONFIG_MODULE_SIG_FORCE
 module_param(sig_enforce, bool_enable_only, 0644);
-#endif /* !CONFIG_MODULE_SIG_FORCE */
+
+/*
+ * Export sig_enforce kernel cmdline parameter to allow other subsystems rely
+ * on that instead of directly to CONFIG_MODULE_SIG_FORCE config.
+ */
+bool is_module_sig_enforced(void)
+{
+	return sig_enforce;
+}
+EXPORT_SYMBOL(is_module_sig_enforced);
 
 /* Block module loading/unloading? */
 int modules_disabled = 0;
@@ -298,24 +301,6 @@ int unregister_module_notifier(struct notifier_block *nb)
 	return blocking_notifier_chain_unregister(&module_notify_list, nb);
 }
 EXPORT_SYMBOL(unregister_module_notifier);
-
-struct load_info {
-	const char *name;
-	Elf_Ehdr *hdr;
-	unsigned long len;
-	Elf_Shdr *sechdrs;
-	char *secstrings, *strtab;
-	unsigned long symoffs, stroffs;
-	struct _ddebug *debug;
-	unsigned int num_debug;
-	bool sig_ok;
-#ifdef CONFIG_KALLSYMS
-	unsigned long mod_kallsyms_init_off;
-#endif
-	struct {
-		unsigned int sym, str, mod, vers, info, pcpu;
-	} index;
-};
 
 /*
  * We require a truly strong try_module_get(): 0 means success.
@@ -539,12 +524,30 @@ static bool check_symbol(const struct symsearch *syms,
 	return true;
 }
 
+static unsigned long kernel_symbol_value(const struct kernel_symbol *sym)
+{
+#ifdef CONFIG_HAVE_ARCH_PREL32_RELOCATIONS
+	return (unsigned long)offset_to_ptr(&sym->value_offset);
+#else
+	return sym->value;
+#endif
+}
+
+static const char *kernel_symbol_name(const struct kernel_symbol *sym)
+{
+#ifdef CONFIG_HAVE_ARCH_PREL32_RELOCATIONS
+	return offset_to_ptr(&sym->name_offset);
+#else
+	return sym->name;
+#endif
+}
+
 static int cmp_name(const void *va, const void *vb)
 {
 	const char *a;
 	const struct kernel_symbol *b;
 	a = va; b = vb;
-	return strcmp(a, b->name);
+	return strcmp(a, kernel_symbol_name(b));
 }
 
 static bool find_symbol_in_section(const struct symsearch *syms,
@@ -837,10 +840,8 @@ static int add_module_usage(struct module *a, struct module *b)
 
 	pr_debug("Allocating new usage for %s.\n", a->name);
 	use = kmalloc(sizeof(*use), GFP_ATOMIC);
-	if (!use) {
-		pr_warn("%s: out of memory loading\n", a->name);
+	if (!use)
 		return -ENOMEM;
-	}
 
 	use->source = a;
 	use->target = b;
@@ -1201,8 +1202,10 @@ static ssize_t store_uevent(struct module_attribute *mattr,
 			    struct module_kobject *mk,
 			    const char *buffer, size_t count)
 {
-	kobject_synth_uevent(&mk->kobj, buffer, count);
-	return count;
+	int rc;
+
+	rc = kobject_synth_uevent(&mk->kobj, buffer, count);
+	return rc ? rc : count;
 }
 
 struct module_attribute module_uevent =
@@ -1333,14 +1336,12 @@ static inline int check_modstruct_version(const struct load_info *info,
 	 * locking is necessary -- use preempt_disable() to placate lockdep.
 	 */
 	preempt_disable();
-	if (!find_symbol(VMLINUX_SYMBOL_STR(module_layout), NULL,
-			 &crc, true, false)) {
+	if (!find_symbol("module_layout", NULL, &crc, true, false)) {
 		preempt_enable();
 		BUG();
 	}
 	preempt_enable();
-	return check_version(info, VMLINUX_SYMBOL_STR(module_layout),
-			     mod, crc);
+	return check_version(info, "module_layout", mod, crc);
 }
 
 /* First part is kernel version, which we ignore if module has crcs. */
@@ -1464,7 +1465,8 @@ static ssize_t module_sect_show(struct module_attribute *mattr,
 {
 	struct module_sect_attr *sattr =
 		container_of(mattr, struct module_sect_attr, mattr);
-	return sprintf(buf, "0x%pK\n", (void *)sattr->address);
+	return sprintf(buf, "0x%px\n", kptr_restrict < 2 ?
+		       (void *)sattr->address : NULL);
 }
 
 static void free_sect_attrs(struct module_sect_attrs *sect_attrs)
@@ -1516,7 +1518,7 @@ static void add_sect_attrs(struct module *mod, const struct load_info *info)
 		sattr->mattr.show = module_sect_show;
 		sattr->mattr.store = NULL;
 		sattr->mattr.attr.name = sattr->name;
-		sattr->mattr.attr.mode = S_IRUGO;
+		sattr->mattr.attr.mode = S_IRUSR;
 		*(gattr++) = &(sattr++)->mattr.attr;
 	}
 	*gattr = NULL;
@@ -1595,8 +1597,7 @@ static void add_notes_attrs(struct module *mod, const struct load_info *info)
 	if (notes == 0)
 		return;
 
-	notes_attrs = kzalloc(sizeof(*notes_attrs)
-			      + notes * sizeof(notes_attrs->attrs[0]),
+	notes_attrs = kzalloc(struct_size(notes_attrs, attrs, notes),
 			      GFP_KERNEL);
 	if (notes_attrs == NULL)
 		return;
@@ -1693,6 +1694,8 @@ static int add_usage_links(struct module *mod)
 	return ret;
 }
 
+static void module_remove_modinfo_attrs(struct module *mod, int end);
+
 static int module_add_modinfo_attrs(struct module *mod)
 {
 	struct module_attribute *attr;
@@ -1707,24 +1710,34 @@ static int module_add_modinfo_attrs(struct module *mod)
 		return -ENOMEM;
 
 	temp_attr = mod->modinfo_attrs;
-	for (i = 0; (attr = modinfo_attrs[i]) && !error; i++) {
+	for (i = 0; (attr = modinfo_attrs[i]); i++) {
 		if (!attr->test || attr->test(mod)) {
 			memcpy(temp_attr, attr, sizeof(*temp_attr));
 			sysfs_attr_init(&temp_attr->attr);
 			error = sysfs_create_file(&mod->mkobj.kobj,
 					&temp_attr->attr);
+			if (error)
+				goto error_out;
 			++temp_attr;
 		}
 	}
+
+	return 0;
+
+error_out:
+	if (i > 0)
+		module_remove_modinfo_attrs(mod, --i);
 	return error;
 }
 
-static void module_remove_modinfo_attrs(struct module *mod)
+static void module_remove_modinfo_attrs(struct module *mod, int end)
 {
 	struct module_attribute *attr;
 	int i;
 
 	for (i = 0; (attr = &mod->modinfo_attrs[i]); i++) {
+		if (end >= 0 && i > end)
+			break;
 		/* pick a field to test for end of list */
 		if (!attr->attr.name)
 			break;
@@ -1812,7 +1825,7 @@ static int mod_sysfs_setup(struct module *mod,
 	return 0;
 
 out_unreg_modinfo_attrs:
-	module_remove_modinfo_attrs(mod);
+	module_remove_modinfo_attrs(mod, -1);
 out_unreg_param:
 	module_param_sysfs_remove(mod);
 out_unreg_holders:
@@ -1848,7 +1861,7 @@ static void mod_sysfs_fini(struct module *mod)
 {
 }
 
-static void module_remove_modinfo_attrs(struct module *mod)
+static void module_remove_modinfo_attrs(struct module *mod, int end)
 {
 }
 
@@ -1864,14 +1877,14 @@ static void init_param_lock(struct module *mod)
 static void mod_sysfs_teardown(struct module *mod)
 {
 	del_usage_links(mod);
-	module_remove_modinfo_attrs(mod);
+	module_remove_modinfo_attrs(mod, -1);
 	module_param_sysfs_remove(mod);
 	kobject_put(mod->mkobj.drivers_dir);
 	kobject_put(mod->holders_dir);
 	mod_sysfs_fini(mod);
 }
 
-#ifdef CONFIG_STRICT_MODULE_RWX
+#ifdef CONFIG_ARCH_HAS_STRICT_MODULE_RWX
 /*
  * LKM RO/NX protection: protect module's text/ro-data
  * from modification and any data from execution.
@@ -1894,6 +1907,7 @@ static void frob_text(const struct module_layout *layout,
 		   layout->text_size >> PAGE_SHIFT);
 }
 
+#ifdef CONFIG_STRICT_MODULE_RWX
 static void frob_rodata(const struct module_layout *layout,
 			int (*set_memory)(unsigned long start, int num_pages))
 {
@@ -1943,6 +1957,7 @@ void module_enable_ro(const struct module *mod, bool after_init)
 		return;
 
 	frob_text(&mod->core_layout, set_memory_ro);
+
 	frob_rodata(&mod->core_layout, set_memory_ro);
 	frob_text(&mod->init_layout, set_memory_ro);
 	frob_rodata(&mod->init_layout, set_memory_ro);
@@ -2025,11 +2040,23 @@ static void disable_ro_nx(const struct module_layout *layout)
 	frob_writable_data(layout, set_memory_x);
 }
 
-#else
+#else /* !CONFIG_STRICT_MODULE_RWX */
 static void disable_ro_nx(const struct module_layout *layout) { }
 static void module_enable_nx(const struct module *mod) { }
 static void module_disable_nx(const struct module *mod) { }
-#endif
+#endif /*  CONFIG_STRICT_MODULE_RWX */
+
+static void module_enable_x(const struct module *mod)
+{
+	frob_text(&mod->core_layout, set_memory_x);
+	frob_text(&mod->init_layout, set_memory_x);
+}
+#else /* !CONFIG_ARCH_HAS_STRICT_MODULE_RWX */
+static void disable_ro_nx(const struct module_layout *layout) { }
+static void module_enable_nx(const struct module *mod) { }
+static void module_disable_nx(const struct module *mod) { }
+static void module_enable_x(const struct module *mod) { }
+#endif /* CONFIG_ARCH_HAS_STRICT_MODULE_RWX */
 
 #ifdef CONFIG_LIVEPATCH
 /*
@@ -2053,21 +2080,19 @@ static int copy_module_elf(struct module *mod, struct load_info *info)
 
 	/* Elf section header table */
 	size = sizeof(*info->sechdrs) * info->hdr->e_shnum;
-	mod->klp_info->sechdrs = kmalloc(size, GFP_KERNEL);
+	mod->klp_info->sechdrs = kmemdup(info->sechdrs, size, GFP_KERNEL);
 	if (mod->klp_info->sechdrs == NULL) {
 		ret = -ENOMEM;
 		goto free_info;
 	}
-	memcpy(mod->klp_info->sechdrs, info->sechdrs, size);
 
 	/* Elf section name string table */
 	size = info->sechdrs[info->hdr->e_shstrndx].sh_size;
-	mod->klp_info->secstrings = kmalloc(size, GFP_KERNEL);
+	mod->klp_info->secstrings = kmemdup(info->secstrings, size, GFP_KERNEL);
 	if (mod->klp_info->secstrings == NULL) {
 		ret = -ENOMEM;
 		goto free_sechdrs;
 	}
-	memcpy(mod->klp_info->secstrings, info->secstrings, size);
 
 	/* Elf symbol section index */
 	symndx = info->index.sym;
@@ -2173,10 +2198,6 @@ static void free_module(struct module *mod)
 	/* Finally, free the core (containing the module structure) */
 	disable_ro_nx(&mod->core_layout);
 	module_memfree(mod->core_layout.base);
-
-#ifdef CONFIG_MPU
-	update_protections(current->mm);
-#endif
 }
 
 void *__symbol_get(const char *symbol)
@@ -2190,7 +2211,7 @@ void *__symbol_get(const char *symbol)
 		sym = NULL;
 	preempt_enable();
 
-	return sym ? (void *)sym->value : NULL;
+	return sym ? (void *)kernel_symbol_value(sym) : NULL;
 }
 EXPORT_SYMBOL_GPL(__symbol_get);
 
@@ -2220,10 +2241,12 @@ static int verify_export_symbols(struct module *mod)
 
 	for (i = 0; i < ARRAY_SIZE(arr); i++) {
 		for (s = arr[i].sym; s < arr[i].sym + arr[i].num; s++) {
-			if (find_symbol(s->name, &owner, NULL, true, false)) {
+			if (find_symbol(kernel_symbol_name(s), &owner, NULL,
+					true, false)) {
 				pr_err("%s: exports duplicate symbol %s"
 				       " (owned by %s)\n",
-				       mod->name, s->name, module_name(owner));
+				       mod->name, kernel_symbol_name(s),
+				       module_name(owner));
 				return -ENOEXEC;
 			}
 		}
@@ -2272,7 +2295,7 @@ static int simplify_symbols(struct module *mod, const struct load_info *info)
 			ksym = resolve_symbol_wait(mod, info, name);
 			/* Ok if resolved.  */
 			if (ksym && !IS_ERR(ksym)) {
-				sym[i].st_value = ksym->value;
+				sym[i].st_value = kernel_symbol_value(ksym);
 				break;
 			}
 
@@ -2280,9 +2303,9 @@ static int simplify_symbols(struct module *mod, const struct load_info *info)
 			if (!ksym && ELF_ST_BIND(sym[i].st_info) == STB_WEAK)
 				break;
 
-			pr_warn("%s: Unknown symbol %s (err %li)\n",
-				mod->name, name, PTR_ERR(ksym));
 			ret = PTR_ERR(ksym) ?: -ENOENT;
+			pr_warn("%s: Unknown symbol %s (err %d)\n",
+				mod->name, name, ret);
 			break;
 
 		default:
@@ -2484,7 +2507,11 @@ static char *get_modinfo(struct load_info *info, const char *tag)
 	Elf_Shdr *infosec = &info->sechdrs[info->index.info];
 	unsigned long size = infosec->sh_size;
 
-	for (p = (char *)infosec->sh_addr; p; p = next_string(p, &size)) {
+	/*
+	 * get_modinfo() calls made before rewrite_section_headers()
+	 * must use sh_offset, as sh_addr isn't set!
+	 */
+	for (p = (char *)info->hdr + infosec->sh_offset; p; p = next_string(p, &size)) {
 		if (strncmp(p, tag, taglen) == 0 && p[taglen] == '=')
 			return p + taglen + 1;
 	}
@@ -2532,7 +2559,7 @@ static int is_exported(const char *name, unsigned long value,
 		ks = lookup_symbol(name, __start___ksymtab, __stop___ksymtab);
 	else
 		ks = lookup_symbol(name, mod->syms, mod->syms + mod->num_syms);
-	return ks != NULL && ks->value == value;
+	return ks != NULL && kernel_symbol_value(ks) == value;
 }
 
 /* As per nm */
@@ -2772,7 +2799,7 @@ static int module_sig_check(struct load_info *info, int flags)
 	    memcmp(mod + info->len - markerlen, MODULE_SIG_STRING, markerlen) == 0) {
 		/* We truncate the module to discard the signature */
 		info->len -= markerlen;
-		err = mod_verify_sig(mod, &info->len);
+		err = mod_verify_sig(mod, info);
 	}
 
 	if (!err) {
@@ -2781,7 +2808,7 @@ static int module_sig_check(struct load_info *info, int flags)
 	}
 
 	/* Not having a signature is only an error if we're strict. */
-	if (err == -ENOKEY && !sig_enforce)
+	if (err == -ENOKEY && !is_module_sig_enforced())
 		err = 0;
 
 	return err;
@@ -2874,7 +2901,7 @@ static int copy_module_from_user(const void __user *umod, unsigned long len,
 	if (info->len < sizeof(*(info->hdr)))
 		return -ENOEXEC;
 
-	err = security_kernel_read_file(NULL, READING_MODULE);
+	err = security_kernel_load_data(LOADING_MODULE);
 	if (err)
 		return err;
 
@@ -2924,17 +2951,7 @@ static int rewrite_section_headers(struct load_info *info, int flags)
 	}
 
 	/* Track but don't keep modinfo and version sections. */
-	if (flags & MODULE_INIT_IGNORE_MODVERSIONS)
-		info->index.vers = 0; /* Pretend no __versions section! */
-	else
-		info->index.vers = find_sec(info, "__versions");
 	info->sechdrs[info->index.vers].sh_flags &= ~(unsigned long)SHF_ALLOC;
-
-	info->index.info = find_sec(info, ".modinfo");
-	if (!info->index.info)
-		info->name = "(missing .modinfo section)";
-	else
-		info->name = get_modinfo(info, "name");
 	info->sechdrs[info->index.info].sh_flags &= ~(unsigned long)SHF_ALLOC;
 
 	return 0;
@@ -2945,23 +2962,24 @@ static int rewrite_section_headers(struct load_info *info, int flags)
  * search for module section index etc), and do some basic section
  * verification.
  *
- * Return the temporary module pointer (we'll replace it with the final
- * one when we move the module sections around).
+ * Set info->mod to the temporary copy of the module in info->hdr. The final one
+ * will be allocated in move_module().
  */
-static struct module *setup_load_info(struct load_info *info, int flags)
+static int setup_load_info(struct load_info *info, int flags)
 {
 	unsigned int i;
-	int err;
-	struct module *mod;
 
 	/* Set up the convenience variables */
 	info->sechdrs = (void *)info->hdr + info->hdr->e_shoff;
 	info->secstrings = (void *)info->hdr
 		+ info->sechdrs[info->hdr->e_shstrndx].sh_offset;
 
-	err = rewrite_section_headers(info, flags);
-	if (err)
-		return ERR_PTR(err);
+	/* Try to find a name early so we can log errors with a module name */
+	info->index.info = find_sec(info, ".modinfo");
+	if (!info->index.info)
+		info->name = "(missing .modinfo section)";
+	else
+		info->name = get_modinfo(info, "name");
 
 	/* Find internal symbols and strings. */
 	for (i = 1; i < info->hdr->e_shnum; i++) {
@@ -2974,34 +2992,35 @@ static struct module *setup_load_info(struct load_info *info, int flags)
 		}
 	}
 
+	if (info->index.sym == 0) {
+		pr_warn("%s: module has no symbols (stripped?)\n", info->name);
+		return -ENOEXEC;
+	}
+
 	info->index.mod = find_sec(info, ".gnu.linkonce.this_module");
 	if (!info->index.mod) {
 		pr_warn("%s: No module found in object\n",
 			info->name ?: "(missing .modinfo name field)");
-		return ERR_PTR(-ENOEXEC);
+		return -ENOEXEC;
 	}
 	/* This is temporary: point mod into copy of data. */
-	mod = (void *)info->sechdrs[info->index.mod].sh_addr;
+	info->mod = (void *)info->hdr + info->sechdrs[info->index.mod].sh_offset;
 
 	/*
-	 * If we didn't load the .modinfo 'name' field, fall back to
+	 * If we didn't load the .modinfo 'name' field earlier, fall back to
 	 * on-disk struct mod 'name' field.
 	 */
 	if (!info->name)
-		info->name = mod->name;
+		info->name = info->mod->name;
 
-	if (info->index.sym == 0) {
-		pr_warn("%s: module has no symbols (stripped?)\n", info->name);
-		return ERR_PTR(-ENOEXEC);
-	}
+	if (flags & MODULE_INIT_IGNORE_MODVERSIONS)
+		info->index.vers = 0; /* Pretend no __versions section! */
+	else
+		info->index.vers = find_sec(info, "__versions");
 
 	info->index.pcpu = find_pcpusec(info);
 
-	/* Check module struct version now, before we try to use module. */
-	if (!check_modstruct_version(info, mod))
-		return ERR_PTR(-ENOEXEC);
-
-	return mod;
+	return 0;
 }
 
 static int check_modinfo(struct module *mod, struct load_info *info, int flags)
@@ -3097,7 +3116,7 @@ static int find_module_sections(struct module *mod, struct load_info *info)
 					     sizeof(*mod->tracepoints_ptrs),
 					     &mod->num_tracepoints);
 #endif
-#ifdef HAVE_JUMP_LABEL
+#ifdef CONFIG_JUMP_LABEL
 	mod->jump_entries = section_objs(info, "__jump_table",
 					sizeof(*mod->jump_entries),
 					&mod->num_jump_entries);
@@ -3121,7 +3140,11 @@ static int find_module_sections(struct module *mod, struct load_info *info)
 					     sizeof(*mod->ftrace_callsites),
 					     &mod->num_ftrace_callsites);
 #endif
-
+#ifdef CONFIG_FUNCTION_ERROR_INJECTION
+	mod->ei_funcs = section_objs(info, "_error_injection_whitelist",
+					    sizeof(*mod->ei_funcs),
+					    &mod->num_ei_funcs);
+#endif
 	mod->extable = section_objs(info, "__ex_table",
 				    sizeof(*mod->extable), &mod->num_exentries);
 
@@ -3292,25 +3315,17 @@ core_param(module_blacklist, module_blacklist, charp, 0400);
 
 static struct module *layout_and_allocate(struct load_info *info, int flags)
 {
-	/* Module within temporary copy. */
 	struct module *mod;
 	unsigned int ndx;
 	int err;
 
-	mod = setup_load_info(info, flags);
-	if (IS_ERR(mod))
-		return mod;
-
-	if (blacklisted(info->name))
-		return ERR_PTR(-EPERM);
-
-	err = check_modinfo(mod, info, flags);
+	err = check_modinfo(info->mod, info, flags);
 	if (err)
 		return ERR_PTR(err);
 
 	/* Allow arches to frob section contents and sizes.  */
 	err = module_frob_arch_sections(info->hdr, info->sechdrs,
-					info->secstrings, mod);
+					info->secstrings, info->mod);
 	if (err < 0)
 		return ERR_PTR(err);
 
@@ -3329,11 +3344,11 @@ static struct module *layout_and_allocate(struct load_info *info, int flags)
 	/* Determine total sizes, and put offsets in sh_entsize.  For now
 	   this is done generically; there doesn't appear to be any
 	   special cases for the architectures. */
-	layout_sections(mod, info);
-	layout_symtab(mod, info);
+	layout_sections(info->mod, info);
+	layout_symtab(info->mod, info);
 
 	/* Allocate and move to the final place */
-	err = move_module(mod, info);
+	err = move_module(info->mod, info);
 	if (err)
 		return ERR_PTR(err);
 
@@ -3389,8 +3404,7 @@ static bool finished_loading(const char *name)
 	sched_annotate_sleep();
 	mutex_lock(&module_mutex);
 	mod = find_module_all(name, strlen(name), true);
-	ret = !mod || mod->state == MODULE_STATE_LIVE
-		|| mod->state == MODULE_STATE_GOING;
+	ret = !mod || mod->state == MODULE_STATE_LIVE;
 	mutex_unlock(&module_mutex);
 
 	return ret;
@@ -3484,6 +3498,8 @@ static noinline int do_init_module(struct module *mod)
 	if (!mod->async_probe_requested && (current->flags & PF_USED_ASYNC))
 		async_synchronize_full();
 
+	ftrace_free_mem(mod, mod->init_layout.base, mod->init_layout.base +
+			mod->init_layout.size);
 	mutex_lock(&module_mutex);
 	/* Drop initial reference. */
 	module_put(mod);
@@ -3558,8 +3574,7 @@ again:
 	mutex_lock(&module_mutex);
 	old = find_module_all(mod->name, strlen(mod->name), true);
 	if (old != NULL) {
-		if (old->state == MODULE_STATE_COMING
-		    || old->state == MODULE_STATE_UNFORMED) {
+		if (old->state != MODULE_STATE_LIVE) {
 			/* Wait in case it fails to load. */
 			mutex_unlock(&module_mutex);
 			err = wait_event_interruptible(module_wq,
@@ -3598,6 +3613,7 @@ static int complete_formation(struct module *mod, struct load_info *info)
 
 	module_enable_ro(mod, false);
 	module_enable_nx(mod);
+	module_enable_x(mod);
 
 	/* Mark state as coming so strong_try_module_get() ignores us,
 	 * but kallsyms etc. can see us. */
@@ -3649,16 +3665,35 @@ static int load_module(struct load_info *info, const char __user *uargs,
 		       int flags)
 {
 	struct module *mod;
-	long err;
+	long err = 0;
 	char *after_dashes;
+
+	err = elf_header_check(info);
+	if (err)
+		goto free_copy;
+
+	err = setup_load_info(info, flags);
+	if (err)
+		goto free_copy;
+
+	if (blacklisted(info->name)) {
+		err = -EPERM;
+		goto free_copy;
+	}
 
 	err = module_sig_check(info, flags);
 	if (err)
 		goto free_copy;
 
-	err = elf_header_check(info);
+	err = rewrite_section_headers(info, flags);
 	if (err)
 		goto free_copy;
+
+	/* Check module struct version now, before we try to use module. */
+	if (!check_modstruct_version(info, info->mod)) {
+		err = -ENOEXEC;
+		goto free_copy;
+	}
 
 	/* Figure out module layout, and allocate all the memory. */
 	mod = layout_and_allocate(info, flags);
@@ -3795,6 +3830,7 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	module_disable_nx(mod);
 
  ddebug_cleanup:
+	ftrace_release_mod(mod);
 	dynamic_debug_remove(mod, info->debug);
 	synchronize_sched();
 	kfree(mod->args);
@@ -3814,12 +3850,6 @@ static int load_module(struct load_info *info, const char __user *uargs,
 	synchronize_sched();
 	mutex_unlock(&module_mutex);
  free_module:
-	/*
-	 * Ftrace needs to clean up what it initialized.
-	 * This does nothing if ftrace_module_init() wasn't called,
-	 * but it must be called outside of module_mutex.
-	 */
-	ftrace_release_mod(mod);
 	/* Free lock-classes; relies on the preceding sync_rcu() */
 	lockdep_free_key_range(mod->core_layout.base, mod->core_layout.size);
 
@@ -3942,6 +3972,12 @@ static const char *get_ksymbol(struct module *mod,
 	if (offset)
 		*offset = addr - kallsyms->symtab[best].st_value;
 	return symname(kallsyms, best);
+}
+
+void * __weak dereference_module_function_descriptor(struct module *mod,
+						     void *ptr)
+{
+	return ptr;
 }
 
 /* For kallsyms to ask for address resolution.  NULL means not found.  Careful
@@ -4167,6 +4203,7 @@ static int m_show(struct seq_file *m, void *p)
 {
 	struct module *mod = list_entry(p, struct module, list);
 	char buf[MODULE_FLAGS_BUF_SIZE];
+	void *value;
 
 	/* We always ignore unformed modules. */
 	if (mod->state == MODULE_STATE_UNFORMED)
@@ -4182,7 +4219,8 @@ static int m_show(struct seq_file *m, void *p)
 		   mod->state == MODULE_STATE_COMING ? "Loading" :
 		   "Live");
 	/* Used by oprofile and other similar tools. */
-	seq_printf(m, " 0x%pK", mod->core_layout.base);
+	value = m->private ? NULL : mod->core_layout.base;
+	seq_printf(m, " 0x%px", value);
 
 	/* Taints info */
 	if (mod->taints)
@@ -4204,9 +4242,23 @@ static const struct seq_operations modules_op = {
 	.show	= m_show
 };
 
+/*
+ * This also sets the "private" pointer to non-NULL if the
+ * kernel pointers should be hidden (so you can just test
+ * "m->private" to see if you should keep the values private).
+ *
+ * We use the same logic as for /proc/kallsyms.
+ */
 static int modules_open(struct inode *inode, struct file *file)
 {
-	return seq_open(file, &modules_op);
+	int err = seq_open(file, &modules_op);
+
+	if (!err) {
+		struct seq_file *m = file->private_data;
+		m->private = kallsyms_show_value() ? NULL : (void *)8ul;
+	}
+
+	return err;
 }
 
 static const struct file_operations proc_modules_operations = {

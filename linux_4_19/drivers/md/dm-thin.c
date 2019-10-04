@@ -246,9 +246,9 @@ struct pool {
 	struct dm_bio_prison *prison;
 	struct dm_kcopyd_client *copier;
 
+	struct work_struct worker;
 	struct workqueue_struct *wq;
 	struct throttle throttle;
-	struct work_struct worker;
 	struct delayed_work waker;
 	struct delayed_work no_space_timeout;
 
@@ -257,6 +257,7 @@ struct pool {
 
 	spinlock_t lock;
 	struct bio_list deferred_flush_bios;
+	struct bio_list deferred_flush_completions;
 	struct list_head prepared_mappings;
 	struct list_head prepared_discards;
 	struct list_head prepared_discards_pt2;
@@ -266,7 +267,6 @@ struct pool {
 	struct dm_deferred_set *all_io_ds;
 
 	struct dm_thin_new_mapping *next_mapping;
-	mempool_t *mapping_pool;
 
 	process_bio_fn process_bio;
 	process_bio_fn process_discard;
@@ -279,6 +279,8 @@ struct pool {
 	process_mapping_fn process_prepared_discard_pt2;
 
 	struct dm_bio_prison_cell **cell_sort_array;
+
+	mempool_t mapping_pool;
 };
 
 static void metadata_operation_failed(struct pool *pool, const char *op, int r);
@@ -525,6 +527,11 @@ static void pool_table_init(void)
 {
 	mutex_init(&dm_thin_pool_table.mutex);
 	INIT_LIST_HEAD(&dm_thin_pool_table.pools);
+}
+
+static void pool_table_exit(void)
+{
+	mutex_destroy(&dm_thin_pool_table.mutex);
 }
 
 static void __pool_table_insert(struct pool *pool)
@@ -947,7 +954,40 @@ static void process_prepared_mapping_fail(struct dm_thin_new_mapping *m)
 {
 	cell_error(m->tc->pool, m->cell);
 	list_del(&m->list);
-	mempool_free(m, m->tc->pool->mapping_pool);
+	mempool_free(m, &m->tc->pool->mapping_pool);
+}
+
+static void complete_overwrite_bio(struct thin_c *tc, struct bio *bio)
+{
+	struct pool *pool = tc->pool;
+	unsigned long flags;
+
+	/*
+	 * If the bio has the REQ_FUA flag set we must commit the metadata
+	 * before signaling its completion.
+	 */
+	if (!bio_triggers_commit(tc, bio)) {
+		bio_endio(bio);
+		return;
+	}
+
+	/*
+	 * Complete bio with an error if earlier I/O caused changes to the
+	 * metadata that can't be committed, e.g, due to I/O errors on the
+	 * metadata device.
+	 */
+	if (dm_thin_aborted_changes(tc->td)) {
+		bio_io_error(bio);
+		return;
+	}
+
+	/*
+	 * Batch together any bios that trigger commits and then issue a
+	 * single commit for them in process_deferred_bios().
+	 */
+	spin_lock_irqsave(&pool->lock, flags);
+	bio_list_add(&pool->deferred_flush_completions, bio);
+	spin_unlock_irqrestore(&pool->lock, flags);
 }
 
 static void process_prepared_mapping(struct dm_thin_new_mapping *m)
@@ -982,7 +1022,7 @@ static void process_prepared_mapping(struct dm_thin_new_mapping *m)
 	 */
 	if (bio) {
 		inc_remap_and_issue_cell(tc, m->cell, m->data_block);
-		bio_endio(bio);
+		complete_overwrite_bio(tc, bio);
 	} else {
 		inc_all_io_entry(tc->pool, m->cell->holder);
 		remap_and_issue(tc, m->cell->holder, m->data_block);
@@ -991,7 +1031,7 @@ static void process_prepared_mapping(struct dm_thin_new_mapping *m)
 
 out:
 	list_del(&m->list);
-	mempool_free(m, pool->mapping_pool);
+	mempool_free(m, &pool->mapping_pool);
 }
 
 /*----------------------------------------------------------------*/
@@ -1001,7 +1041,7 @@ static void free_discard_mapping(struct dm_thin_new_mapping *m)
 	struct thin_c *tc = m->tc;
 	if (m->cell)
 		cell_defer_no_holder(tc, m->cell);
-	mempool_free(m, tc->pool->mapping_pool);
+	mempool_free(m, &tc->pool->mapping_pool);
 }
 
 static void process_prepared_discard_fail(struct dm_thin_new_mapping *m)
@@ -1029,7 +1069,7 @@ static void process_prepared_discard_no_passdown(struct dm_thin_new_mapping *m)
 		bio_endio(m->bio);
 
 	cell_defer_no_holder(tc, m->cell);
-	mempool_free(m, tc->pool->mapping_pool);
+	mempool_free(m, &tc->pool->mapping_pool);
 }
 
 /*----------------------------------------------------------------*/
@@ -1042,7 +1082,7 @@ static void passdown_double_checking_shared_status(struct dm_thin_new_mapping *m
 	 * passdown we have to check that these blocks are now unused.
 	 */
 	int r = 0;
-	bool used = true;
+	bool shared = true;
 	struct thin_c *tc = m->tc;
 	struct pool *pool = tc->pool;
 	dm_block_t b = m->data_block, e, end = m->data_block + m->virt_end - m->virt_begin;
@@ -1052,11 +1092,11 @@ static void passdown_double_checking_shared_status(struct dm_thin_new_mapping *m
 	while (b != end) {
 		/* find start of unmapped run */
 		for (; b < end; b++) {
-			r = dm_pool_block_is_used(pool->pmd, b, &used);
+			r = dm_pool_block_is_shared(pool->pmd, b, &shared);
 			if (r)
 				goto out;
 
-			if (!used)
+			if (!shared)
 				break;
 		}
 
@@ -1065,11 +1105,11 @@ static void passdown_double_checking_shared_status(struct dm_thin_new_mapping *m
 
 		/* find end of run */
 		for (e = b + 1; e != end; e++) {
-			r = dm_pool_block_is_used(pool->pmd, e, &used);
+			r = dm_pool_block_is_shared(pool->pmd, e, &shared);
 			if (r)
 				goto out;
 
-			if (used)
+			if (shared)
 				break;
 		}
 
@@ -1122,7 +1162,7 @@ static void process_prepared_discard_passdown_pt1(struct dm_thin_new_mapping *m)
 		metadata_operation_failed(pool, "dm_thin_remove_range", r);
 		bio_io_error(m->bio);
 		cell_defer_no_holder(tc, m->cell);
-		mempool_free(m, pool->mapping_pool);
+		mempool_free(m, &pool->mapping_pool);
 		return;
 	}
 
@@ -1135,7 +1175,7 @@ static void process_prepared_discard_passdown_pt1(struct dm_thin_new_mapping *m)
 		metadata_operation_failed(pool, "dm_pool_inc_data_range", r);
 		bio_io_error(m->bio);
 		cell_defer_no_holder(tc, m->cell);
-		mempool_free(m, pool->mapping_pool);
+		mempool_free(m, &pool->mapping_pool);
 		return;
 	}
 
@@ -1180,7 +1220,7 @@ static void process_prepared_discard_passdown_pt2(struct dm_thin_new_mapping *m)
 		bio_endio(m->bio);
 
 	cell_defer_no_holder(tc, m->cell);
-	mempool_free(m, pool->mapping_pool);
+	mempool_free(m, &pool->mapping_pool);
 }
 
 static void process_prepared(struct pool *pool, struct list_head *head,
@@ -1226,7 +1266,7 @@ static int ensure_next_mapping(struct pool *pool)
 	if (pool->next_mapping)
 		return 0;
 
-	pool->next_mapping = mempool_alloc(pool->mapping_pool, GFP_ATOMIC);
+	pool->next_mapping = mempool_alloc(&pool->mapping_pool, GFP_ATOMIC);
 
 	return pool->next_mapping ? 0 : -ENOMEM;
 }
@@ -1249,18 +1289,13 @@ static struct dm_thin_new_mapping *get_next_mapping(struct pool *pool)
 static void ll_zero(struct thin_c *tc, struct dm_thin_new_mapping *m,
 		    sector_t begin, sector_t end)
 {
-	int r;
 	struct dm_io_region to;
 
 	to.bdev = tc->pool_dev->bdev;
 	to.sector = begin;
 	to.count = end - begin;
 
-	r = dm_kcopyd_zero(tc->pool->copier, 1, &to, 0, copy_complete, m);
-	if (r < 0) {
-		DMERR_LIMIT("dm_kcopyd_zero() failed");
-		copy_complete(1, 1, m);
-	}
+	dm_kcopyd_zero(tc->pool->copier, 1, &to, 0, copy_complete, m);
 }
 
 static void remap_and_issue_overwrite(struct thin_c *tc, struct bio *bio,
@@ -1286,7 +1321,6 @@ static void schedule_copy(struct thin_c *tc, dm_block_t virt_block,
 			  struct dm_bio_prison_cell *cell, struct bio *bio,
 			  sector_t len)
 {
-	int r;
 	struct pool *pool = tc->pool;
 	struct dm_thin_new_mapping *m = get_next_mapping(pool);
 
@@ -1325,19 +1359,8 @@ static void schedule_copy(struct thin_c *tc, dm_block_t virt_block,
 		to.sector = data_dest * pool->sectors_per_block;
 		to.count = len;
 
-		r = dm_kcopyd_copy(pool->copier, &from, 1, &to,
-				   0, copy_complete, m);
-		if (r < 0) {
-			DMERR_LIMIT("dm_kcopyd_copy() failed");
-			copy_complete(1, 1, m);
-
-			/*
-			 * We allow the zero to be issued, to simplify the
-			 * error path.  Otherwise we'd need to start
-			 * worrying about decrementing the prepare_actions
-			 * counter.
-			 */
-		}
+		dm_kcopyd_copy(pool->copier, &from, 1, &to,
+			       0, copy_complete, m);
 
 		/*
 		 * Do we need to zero a tail region?
@@ -1803,7 +1826,7 @@ static void __remap_and_issue_shared_cell(void *context,
 		    bio_op(bio) == REQ_OP_DISCARD)
 			bio_list_add(&info->defer_bios, bio);
 		else {
-			struct dm_thin_endio_hook *h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));;
+			struct dm_thin_endio_hook *h = dm_per_bio_data(bio, sizeof(struct dm_thin_endio_hook));
 
 			h->shared_read_entry = dm_deferred_entry_inc(info->tc->pool->shared_read_ds);
 			inc_all_io_entry(info->tc->pool, bio);
@@ -2328,7 +2351,7 @@ static void process_deferred_bios(struct pool *pool)
 {
 	unsigned long flags;
 	struct bio *bio;
-	struct bio_list bios;
+	struct bio_list bios, bio_completions;
 	struct thin_c *tc;
 
 	tc = get_first_thin(pool);
@@ -2339,25 +2362,35 @@ static void process_deferred_bios(struct pool *pool)
 	}
 
 	/*
-	 * If there are any deferred flush bios, we must commit
-	 * the metadata before issuing them.
+	 * If there are any deferred flush bios, we must commit the metadata
+	 * before issuing them or signaling their completion.
 	 */
 	bio_list_init(&bios);
+	bio_list_init(&bio_completions);
+
 	spin_lock_irqsave(&pool->lock, flags);
 	bio_list_merge(&bios, &pool->deferred_flush_bios);
 	bio_list_init(&pool->deferred_flush_bios);
+
+	bio_list_merge(&bio_completions, &pool->deferred_flush_completions);
+	bio_list_init(&pool->deferred_flush_completions);
 	spin_unlock_irqrestore(&pool->lock, flags);
 
-	if (bio_list_empty(&bios) &&
+	if (bio_list_empty(&bios) && bio_list_empty(&bio_completions) &&
 	    !(dm_pool_changed_this_transaction(pool->pmd) && need_commit_due_to_time(pool)))
 		return;
 
 	if (commit(pool)) {
+		bio_list_merge(&bios, &bio_completions);
+
 		while ((bio = bio_list_pop(&bios)))
 			bio_io_error(bio);
 		return;
 	}
 	pool->last_commit_jiffies = jiffies;
+
+	while ((bio = bio_list_pop(&bio_completions)))
+		bio_endio(bio);
 
 	while ((bio = bio_list_pop(&bios)))
 		generic_make_request(bio);
@@ -2495,7 +2528,7 @@ static void set_pool_mode(struct pool *pool, enum pool_mode new_mode)
 	struct pool_c *pt = pool->ti->private;
 	bool needs_check = dm_pool_metadata_needs_check(pool->pmd);
 	enum pool_mode old_mode = get_pool_mode(pool);
-	unsigned long no_space_timeout = ACCESS_ONCE(no_space_timeout_secs) * HZ;
+	unsigned long no_space_timeout = READ_ONCE(no_space_timeout_secs) * HZ;
 
 	/*
 	 * Never allow the pool to transition to PM_WRITE mode if user
@@ -2892,8 +2925,8 @@ static void __pool_destroy(struct pool *pool)
 		destroy_workqueue(pool->wq);
 
 	if (pool->next_mapping)
-		mempool_free(pool->next_mapping, pool->mapping_pool);
-	mempool_destroy(pool->mapping_pool);
+		mempool_free(pool->next_mapping, &pool->mapping_pool);
+	mempool_exit(&pool->mapping_pool);
 	dm_deferred_set_destroy(pool->shared_read_ds);
 	dm_deferred_set_destroy(pool->all_io_ds);
 	kfree(pool);
@@ -2918,7 +2951,7 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 		return (struct pool *)pmd;
 	}
 
-	pool = kmalloc(sizeof(*pool), GFP_KERNEL);
+	pool = kzalloc(sizeof(*pool), GFP_KERNEL);
 	if (!pool) {
 		*error = "Error allocating memory for pool";
 		err_p = ERR_PTR(-ENOMEM);
@@ -2965,6 +2998,7 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 	INIT_DELAYED_WORK(&pool->no_space_timeout, do_no_space_timeout);
 	spin_lock_init(&pool->lock);
 	bio_list_init(&pool->deferred_flush_bios);
+	bio_list_init(&pool->deferred_flush_completions);
 	INIT_LIST_HEAD(&pool->prepared_mappings);
 	INIT_LIST_HEAD(&pool->prepared_discards);
 	INIT_LIST_HEAD(&pool->prepared_discards_pt2);
@@ -2988,15 +3022,17 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 	}
 
 	pool->next_mapping = NULL;
-	pool->mapping_pool = mempool_create_slab_pool(MAPPING_POOL_SIZE,
-						      _new_mapping_cache);
-	if (!pool->mapping_pool) {
+	r = mempool_init_slab_pool(&pool->mapping_pool, MAPPING_POOL_SIZE,
+				   _new_mapping_cache);
+	if (r) {
 		*error = "Error creating pool's mapping mempool";
-		err_p = ERR_PTR(-ENOMEM);
+		err_p = ERR_PTR(r);
 		goto bad_mapping_pool;
 	}
 
-	pool->cell_sort_array = vmalloc(sizeof(*pool->cell_sort_array) * CELL_SORT_ARRAY_SIZE);
+	pool->cell_sort_array =
+		vmalloc(array_size(CELL_SORT_ARRAY_SIZE,
+				   sizeof(*pool->cell_sort_array)));
 	if (!pool->cell_sort_array) {
 		*error = "Error allocating cell sort array";
 		err_p = ERR_PTR(-ENOMEM);
@@ -3012,7 +3048,7 @@ static struct pool *pool_create(struct mapped_device *pool_md,
 	return pool;
 
 bad_sort_array:
-	mempool_destroy(pool->mapping_pool);
+	mempool_exit(&pool->mapping_pool);
 bad_mapping_pool:
 	dm_deferred_set_destroy(pool->all_io_ds);
 bad_all_io_ds:
@@ -3246,6 +3282,13 @@ static int pool_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	as.argc = argc;
 	as.argv = argv;
+
+	/* make sure metadata and data are different devices */
+	if (!strcmp(argv[0], argv[1])) {
+		ti->error = "Error setting metadata or data device";
+		r = -EINVAL;
+		goto out_unlock;
+	}
 
 	/*
 	 * Set default pool features.
@@ -3766,7 +3809,8 @@ static int process_release_metadata_snap_mesg(unsigned argc, char **argv, struct
  *   reserve_metadata_snap
  *   release_metadata_snap
  */
-static int pool_message(struct dm_target *ti, unsigned argc, char **argv)
+static int pool_message(struct dm_target *ti, unsigned argc, char **argv,
+			char *result, unsigned maxlen)
 {
 	int r = -EINVAL;
 	struct pool_c *pt = ti->private;
@@ -3942,6 +3986,8 @@ static void pool_status(struct dm_target *ti, status_type_t type,
 		else
 			DMEMIT("- ");
 
+		DMEMIT("%llu ", (unsigned long long)calc_metadata_threshold(pt));
+
 		break;
 
 	case STATUSTYPE_TABLE:
@@ -4031,7 +4077,7 @@ static struct target_type pool_target = {
 	.name = "thin-pool",
 	.features = DM_TARGET_SINGLETON | DM_TARGET_ALWAYS_WRITEABLE |
 		    DM_TARGET_IMMUTABLE,
-	.version = {1, 19, 0},
+	.version = {1, 20, 0},
 	.module = THIS_MODULE,
 	.ctr = pool_ctr,
 	.dtr = pool_dtr,
@@ -4128,6 +4174,12 @@ static int thin_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	tc->sort_bio_list = RB_ROOT;
 
 	if (argc == 3) {
+		if (!strcmp(argv[0], argv[2])) {
+			ti->error = "Error setting origin device";
+			r = -EINVAL;
+			goto bad_origin_dev;
+		}
+
 		r = dm_get_device(ti, argv[2], FMODE_READ, &origin_dev);
 		if (r) {
 			ti->error = "Error opening origin device";
@@ -4405,7 +4457,7 @@ static void thin_io_hints(struct dm_target *ti, struct queue_limits *limits)
 
 static struct target_type thin_target = {
 	.name = "thin",
-	.version = {1, 19, 0},
+	.version = {1, 20, 0},
 	.module	= THIS_MODULE,
 	.ctr = thin_ctr,
 	.dtr = thin_dtr,
@@ -4455,6 +4507,8 @@ static void dm_thin_exit(void)
 	dm_unregister_target(&pool_target);
 
 	kmem_cache_destroy(_new_mapping_cache);
+
+	pool_table_exit();
 }
 
 module_init(dm_thin_init);

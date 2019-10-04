@@ -147,8 +147,8 @@ static int s2mps11_clk_probe(struct platform_device *pdev)
 	if (!s2mps11_clks)
 		return -ENOMEM;
 
-	clk_data = devm_kzalloc(&pdev->dev, sizeof(*clk_data) +
-				sizeof(*clk_data->hws) * S2MPS11_CLKS_NUM,
+	clk_data = devm_kzalloc(&pdev->dev,
+				struct_size(clk_data, hws, S2MPS11_CLKS_NUM),
 				GFP_KERNEL);
 	if (!clk_data)
 		return -ENOMEM;
@@ -255,7 +255,7 @@ MODULE_DEVICE_TABLE(platform, s2mps11_clk_id);
  * This requires of_device_id table.  In the same time this will not change the
  * actual *device* matching so do not add .of_match_table.
  */
-static const struct of_device_id s2mps11_dt_match[] = {
+static const struct of_device_id s2mps11_dt_match[] __used = {
 	{
 		.compatible = "samsung,s2mps11-clk",
 		.data = (void *)S2MPS11X,

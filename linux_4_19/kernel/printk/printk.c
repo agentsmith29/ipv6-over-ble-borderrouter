@@ -38,11 +38,9 @@
 #include <linux/kmsg_dump.h>
 #include <linux/syslog.h>
 #include <linux/cpu.h>
-#include <linux/notifier.h>
 #include <linux/rculist.h>
 #include <linux/poll.h>
 #include <linux/irq_work.h>
-#include <linux/utsname.h>
 #include <linux/ctype.h>
 #include <linux/uio.h>
 #include <linux/sched/clock.h>
@@ -52,6 +50,7 @@
 #include <linux/uaccess.h>
 #include <asm/sections.h>
 
+#include <trace/events/initcall.h>
 #define CREATE_TRACE_POINTS
 #include <trace/events/printk.h>
 
@@ -65,6 +64,9 @@ int console_printk[4] = {
 	CONSOLE_LOGLEVEL_MIN,		/* minimum_console_loglevel */
 	CONSOLE_LOGLEVEL_DEFAULT,	/* default_console_loglevel */
 };
+
+atomic_t ignore_console_lock_warning __read_mostly = ATOMIC_INIT(0);
+EXPORT_SYMBOL(ignore_console_lock_warning);
 
 /*
  * Low level drivers may need that to know if they can schedule in
@@ -131,13 +133,10 @@ static int __init control_devkmsg(char *str)
 	/*
 	 * Set sysctl string accordingly:
 	 */
-	if (devkmsg_log == DEVKMSG_LOG_MASK_ON) {
-		memset(devkmsg_log_str, 0, DEVKMSG_STR_MAX_SIZE);
-		strncpy(devkmsg_log_str, "on", 2);
-	} else if (devkmsg_log == DEVKMSG_LOG_MASK_OFF) {
-		memset(devkmsg_log_str, 0, DEVKMSG_STR_MAX_SIZE);
-		strncpy(devkmsg_log_str, "off", 3);
-	}
+	if (devkmsg_log == DEVKMSG_LOG_MASK_ON)
+		strcpy(devkmsg_log_str, "on");
+	else if (devkmsg_log == DEVKMSG_LOG_MASK_OFF)
+		strcpy(devkmsg_log_str, "off");
 	/* else "ratelimit" which is set by default. */
 
 	/*
@@ -277,6 +276,13 @@ EXPORT_SYMBOL(console_set_on_cmdline);
 /* Flag: console code may call schedule() */
 static int console_may_schedule;
 
+enum con_msg_format_flags {
+	MSG_FORMAT_DEFAULT	= 0,
+	MSG_FORMAT_SYSLOG	= (1 << 0),
+};
+
+static int console_msg_format = MSG_FORMAT_DEFAULT;
+
 /*
  * The printk log buffer consists of a chain of concatenated variable
  * length records. Every record starts with a record header, containing
@@ -345,7 +351,6 @@ static int console_may_schedule;
  */
 
 enum log_flags {
-	LOG_NOCONS	= 1,	/* already flushed, do not print to console */
 	LOG_NEWLINE	= 2,	/* text ended with a newline */
 	LOG_PREFIX	= 4,	/* text started with a prefix */
 	LOG_CONT	= 8,	/* text is a fragment of a continuation line */
@@ -920,13 +925,13 @@ static loff_t devkmsg_llseek(struct file *file, loff_t offset, int whence)
 	return ret;
 }
 
-static unsigned int devkmsg_poll(struct file *file, poll_table *wait)
+static __poll_t devkmsg_poll(struct file *file, poll_table *wait)
 {
 	struct devkmsg_user *user = file->private_data;
-	int ret = 0;
+	__poll_t ret = 0;
 
 	if (!user)
-		return POLLERR|POLLNVAL;
+		return EPOLLERR|EPOLLNVAL;
 
 	poll_wait(file, &log_wait, wait);
 
@@ -934,9 +939,9 @@ static unsigned int devkmsg_poll(struct file *file, poll_table *wait)
 	if (user->seq < log_next_seq) {
 		/* return error when data has vanished underneath us */
 		if (user->seq < log_first_seq)
-			ret = POLLIN|POLLRDNORM|POLLERR|POLLPRI;
+			ret = EPOLLIN|EPOLLRDNORM|EPOLLERR|EPOLLPRI;
 		else
-			ret = POLLIN|POLLRDNORM;
+			ret = EPOLLIN|EPOLLRDNORM;
 	}
 	logbuf_unlock_irq();
 
@@ -1353,71 +1358,68 @@ static int syslog_print_all(char __user *buf, int size, bool clear)
 {
 	char *text;
 	int len = 0;
+	u64 next_seq;
+	u64 seq;
+	u32 idx;
 
 	text = kmalloc(LOG_LINE_MAX + PREFIX_MAX, GFP_KERNEL);
 	if (!text)
 		return -ENOMEM;
 
 	logbuf_lock_irq();
-	if (buf) {
-		u64 next_seq;
-		u64 seq;
-		u32 idx;
+	/*
+	 * Find first record that fits, including all following records,
+	 * into the user-provided buffer for this dump.
+	 */
+	seq = clear_seq;
+	idx = clear_idx;
+	while (seq < log_next_seq) {
+		struct printk_log *msg = log_from_idx(idx);
 
-		/*
-		 * Find first record that fits, including all following records,
-		 * into the user-provided buffer for this dump.
-		 */
-		seq = clear_seq;
-		idx = clear_idx;
-		while (seq < log_next_seq) {
-			struct printk_log *msg = log_from_idx(idx);
+		len += msg_print_text(msg, true, NULL, 0);
+		idx = log_next(idx);
+		seq++;
+	}
 
-			len += msg_print_text(msg, true, NULL, 0);
-			idx = log_next(idx);
-			seq++;
+	/* move first record forward until length fits into the buffer */
+	seq = clear_seq;
+	idx = clear_idx;
+	while (len > size && seq < log_next_seq) {
+		struct printk_log *msg = log_from_idx(idx);
+
+		len -= msg_print_text(msg, true, NULL, 0);
+		idx = log_next(idx);
+		seq++;
+	}
+
+	/* last message fitting into this dump */
+	next_seq = log_next_seq;
+
+	len = 0;
+	while (len >= 0 && seq < next_seq) {
+		struct printk_log *msg = log_from_idx(idx);
+		int textlen;
+
+		textlen = msg_print_text(msg, true, text,
+					 LOG_LINE_MAX + PREFIX_MAX);
+		if (textlen < 0) {
+			len = textlen;
+			break;
 		}
+		idx = log_next(idx);
+		seq++;
 
-		/* move first record forward until length fits into the buffer */
-		seq = clear_seq;
-		idx = clear_idx;
-		while (len > size && seq < log_next_seq) {
-			struct printk_log *msg = log_from_idx(idx);
+		logbuf_unlock_irq();
+		if (copy_to_user(buf + len, text, textlen))
+			len = -EFAULT;
+		else
+			len += textlen;
+		logbuf_lock_irq();
 
-			len -= msg_print_text(msg, true, NULL, 0);
-			idx = log_next(idx);
-			seq++;
-		}
-
-		/* last message fitting into this dump */
-		next_seq = log_next_seq;
-
-		len = 0;
-		while (len >= 0 && seq < next_seq) {
-			struct printk_log *msg = log_from_idx(idx);
-			int textlen;
-
-			textlen = msg_print_text(msg, true, text,
-						 LOG_LINE_MAX + PREFIX_MAX);
-			if (textlen < 0) {
-				len = textlen;
-				break;
-			}
-			idx = log_next(idx);
-			seq++;
-
-			logbuf_unlock_irq();
-			if (copy_to_user(buf + len, text, textlen))
-				len = -EFAULT;
-			else
-				len += textlen;
-			logbuf_lock_irq();
-
-			if (seq < log_first_seq) {
-				/* messages are gone, move to next one */
-				seq = log_first_seq;
-				idx = log_first_idx;
-			}
+		if (seq < log_first_seq) {
+			/* messages are gone, move to next one */
+			seq = log_first_seq;
+			idx = log_first_idx;
 		}
 	}
 
@@ -1429,6 +1431,14 @@ static int syslog_print_all(char __user *buf, int size, bool clear)
 
 	kfree(text);
 	return len;
+}
+
+static void syslog_clear(void)
+{
+	logbuf_lock_irq();
+	clear_seq = log_next_seq;
+	clear_idx = log_next_idx;
+	logbuf_unlock_irq();
 }
 
 int do_syslog(int type, char __user *buf, int len, int source)
@@ -1475,7 +1485,7 @@ int do_syslog(int type, char __user *buf, int len, int source)
 		break;
 	/* Clear ring buffer */
 	case SYSLOG_ACTION_CLEAR:
-		syslog_print_all(NULL, 0, true);
+		syslog_clear();
 		break;
 	/* Disable logging to console */
 	case SYSLOG_ACTION_CONSOLE_OFF:
@@ -1918,6 +1928,7 @@ asmlinkage int vprintk_emit(int facility, int level,
 		preempt_enable();
 	}
 
+	wake_up_klogd();
 	return printed_len;
 }
 EXPORT_SYMBOL(vprintk_emit);
@@ -2076,6 +2087,17 @@ static int __add_preferred_console(char *name, int idx, char *options,
 	c->index = idx;
 	return 0;
 }
+
+static int __init console_msg_format_setup(char *str)
+{
+	if (!strcmp(str, "syslog"))
+		console_msg_format = MSG_FORMAT_SYSLOG;
+	if (!strcmp(str, "default"))
+		console_msg_format = MSG_FORMAT_DEFAULT;
+	return 1;
+}
+__setup("console_msg_format=", console_msg_format_setup);
+
 /*
  * Set up a console.  Called via do_early_param() in init/main.c
  * for each "console=" parameter in the boot command line.
@@ -2161,7 +2183,7 @@ void suspend_console(void)
 {
 	if (!console_suspend_enabled)
 		return;
-	printk("Suspending console(s) (use no_console_suspend to debug)\n");
+	pr_info("Suspending console(s) (use no_console_suspend to debug)\n");
 	console_lock();
 	console_suspended = 1;
 	up_console_sem();
@@ -2241,6 +2263,7 @@ int is_console_locked(void)
 {
 	return console_locked;
 }
+EXPORT_SYMBOL(is_console_locked);
 
 /*
  * Check if we have any console that is capable of printing while cpu is
@@ -2288,9 +2311,7 @@ void console_unlock(void)
 {
 	static char ext_text[CONSOLE_EXT_LOG_MAX];
 	static char text[LOG_LINE_MAX + PREFIX_MAX];
-	static u64 seen_seq;
 	unsigned long flags;
-	bool wake_klogd = false;
 	bool do_cond_resched, retry;
 
 	if (console_suspended) {
@@ -2334,13 +2355,8 @@ again:
 
 		printk_safe_enter_irqsave(flags);
 		raw_spin_lock(&logbuf_lock);
-		if (seen_seq != log_next_seq) {
-			wake_klogd = true;
-			seen_seq = log_next_seq;
-		}
-
 		if (console_seq < log_first_seq) {
-			len = sprintf(text, "** %u printk messages dropped ** ",
+			len = sprintf(text, "** %u printk messages dropped **\n",
 				      (unsigned)(log_first_seq - console_seq));
 
 			/* messages are gone, move to first one */
@@ -2365,7 +2381,10 @@ skip:
 			goto skip;
 		}
 
-		len += msg_print_text(msg, false, text + len, sizeof(text) - len);
+		len += msg_print_text(msg,
+				console_msg_format & MSG_FORMAT_SYSLOG,
+				text + len,
+				sizeof(text) - len);
 		if (nr_ext_console_drivers) {
 			ext_len = msg_print_ext_header(ext_text,
 						sizeof(ext_text),
@@ -2393,7 +2412,7 @@ skip:
 
 		if (console_lock_spinning_disable_and_check()) {
 			printk_safe_exit_irqrestore(flags);
-			goto out;
+			return;
 		}
 
 		printk_safe_exit_irqrestore(flags);
@@ -2425,10 +2444,6 @@ skip:
 
 	if (retry && console_trylock())
 		goto again;
-
-out:
-	if (wake_klogd)
-		wake_up_klogd();
 }
 EXPORT_SYMBOL(console_unlock);
 
@@ -2777,7 +2792,9 @@ EXPORT_SYMBOL(unregister_console);
  */
 void __init console_init(void)
 {
-	initcall_t *call;
+	int ret;
+	initcall_t call;
+	initcall_entry_t *ce;
 
 	/* Setup the default TTY line discipline. */
 	n_tty_init();
@@ -2786,10 +2803,14 @@ void __init console_init(void)
 	 * set up the console device so that later boot sequences can
 	 * inform about problems etc..
 	 */
-	call = __con_initcall_start;
-	while (call < __con_initcall_end) {
-		(*call)();
-		call++;
+	ce = __con_initcall_start;
+	trace_initcall_level("console");
+	while (ce < __con_initcall_end) {
+		call = initcall_from_entry(ce);
+		trace_initcall_start(call);
+		ret = call();
+		trace_initcall_finish(call, ret);
+		ce++;
 	}
 }
 
@@ -3256,64 +3277,5 @@ void kmsg_dump_rewind(struct kmsg_dumper *dumper)
 	logbuf_unlock_irqrestore(flags);
 }
 EXPORT_SYMBOL_GPL(kmsg_dump_rewind);
-
-static char dump_stack_arch_desc_str[128];
-
-/**
- * dump_stack_set_arch_desc - set arch-specific str to show with task dumps
- * @fmt: printf-style format string
- * @...: arguments for the format string
- *
- * The configured string will be printed right after utsname during task
- * dumps.  Usually used to add arch-specific system identifiers.  If an
- * arch wants to make use of such an ID string, it should initialize this
- * as soon as possible during boot.
- */
-void __init dump_stack_set_arch_desc(const char *fmt, ...)
-{
-	va_list args;
-
-	va_start(args, fmt);
-	vsnprintf(dump_stack_arch_desc_str, sizeof(dump_stack_arch_desc_str),
-		  fmt, args);
-	va_end(args);
-}
-
-/**
- * dump_stack_print_info - print generic debug info for dump_stack()
- * @log_lvl: log level
- *
- * Arch-specific dump_stack() implementations can use this function to
- * print out the same debug information as the generic dump_stack().
- */
-void dump_stack_print_info(const char *log_lvl)
-{
-	printk("%sCPU: %d PID: %d Comm: %.20s %s %s %.*s\n",
-	       log_lvl, raw_smp_processor_id(), current->pid, current->comm,
-	       print_tainted(), init_utsname()->release,
-	       (int)strcspn(init_utsname()->version, " "),
-	       init_utsname()->version);
-
-	if (dump_stack_arch_desc_str[0] != '\0')
-		printk("%sHardware name: %s\n",
-		       log_lvl, dump_stack_arch_desc_str);
-
-	print_worker_info(log_lvl, current);
-}
-
-/**
- * show_regs_print_info - print generic debug info for show_regs()
- * @log_lvl: log level
- *
- * show_regs() implementations can use this function to print out generic
- * debug information.
- */
-void show_regs_print_info(const char *log_lvl)
-{
-	dump_stack_print_info(log_lvl);
-
-	printk("%stask: %p task.stack: %p\n",
-	       log_lvl, current, task_stack_page(current));
-}
 
 #endif

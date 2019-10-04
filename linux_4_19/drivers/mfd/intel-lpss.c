@@ -40,8 +40,8 @@
 
 /* Offsets from lpss->priv */
 #define LPSS_PRIV_RESETS		0x04
-#define LPSS_PRIV_RESETS_FUNC		BIT(2)
-#define LPSS_PRIV_RESETS_IDMA		0x3
+#define LPSS_PRIV_RESETS_IDMA		BIT(2)
+#define LPSS_PRIV_RESETS_FUNC		0x3
 
 #define LPSS_PRIV_ACTIVELTR		0x10
 #define LPSS_PRIV_IDLELTR		0x14
@@ -273,6 +273,9 @@ static void intel_lpss_init_dev(const struct intel_lpss *lpss)
 {
 	u32 value = LPSS_PRIV_SSP_REG_DIS_DMA_FIN;
 
+	/* Set the device in reset state */
+	writel(0, lpss->priv + LPSS_PRIV_RESETS);
+
 	intel_lpss_deassert_reset(lpss);
 
 	intel_lpss_set_remap_addr(lpss);
@@ -450,6 +453,8 @@ int intel_lpss_probe(struct device *dev,
 	if (ret)
 		goto err_remove_ltr;
 
+	dev_pm_set_driver_flags(dev, DPM_FLAG_SMART_SUSPEND);
+
 	return 0;
 
 err_remove_ltr:
@@ -478,7 +483,9 @@ EXPORT_SYMBOL_GPL(intel_lpss_remove);
 
 static int resume_lpss_device(struct device *dev, void *data)
 {
-	pm_runtime_resume(dev);
+	if (!dev_pm_test_driver_flags(dev, DPM_FLAG_SMART_SUSPEND))
+		pm_runtime_resume(dev);
+
 	return 0;
 }
 

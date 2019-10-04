@@ -20,7 +20,7 @@
 #include <linux/efi-bgrt.h>
 
 struct acpi_table_bgrt bgrt_tab;
-size_t __initdata bgrt_image_size;
+size_t bgrt_image_size;
 
 struct bmp_header {
 	u16 id;
@@ -48,11 +48,6 @@ void __init efi_bgrt_init(struct acpi_table_header *table)
 	if (bgrt->version != 1) {
 		pr_notice("Ignoring BGRT: invalid version %u (expected 1)\n",
 		       bgrt->version);
-		goto out;
-	}
-	if (bgrt->status & 0xfe) {
-		pr_notice("Ignoring BGRT: reserved status bits are non-zero %u\n",
-		       bgrt->status);
 		goto out;
 	}
 	if (bgrt->image_type != 0) {

@@ -42,7 +42,6 @@ static int snd_rpi_proto_hw_params(struct snd_pcm_substream *substream,
 				       struct snd_pcm_hw_params *params)
 {
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
-	struct snd_soc_codec *codec = rtd->codec;
 	struct snd_soc_dai *codec_dai = rtd->codec_dai;
 	struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
 	int sysclk = 12288000; /* This is fixed on this board */
@@ -50,7 +49,7 @@ static int snd_rpi_proto_hw_params(struct snd_pcm_substream *substream,
 	/* Set proto bclk */
 	int ret = snd_soc_dai_set_bclk_ratio(cpu_dai,32*2);
 	if (ret < 0){
-		dev_err(codec->dev,
+		dev_err(rtd->card->dev,
 				"Failed to set BCLK ratio %d\n", ret);
 		return ret;
 	}
@@ -59,7 +58,7 @@ static int snd_rpi_proto_hw_params(struct snd_pcm_substream *substream,
 	ret = snd_soc_dai_set_sysclk(codec_dai, WM8731_SYSCLK_XTAL,
 			sysclk, SND_SOC_CLOCK_IN);
 	if (ret < 0) {
-		dev_err(codec->dev,
+		dev_err(rtd->card->dev,
 				"Failed to set WM8731 SYSCLK: %d\n", ret);
 		return ret;
 	}
@@ -116,18 +115,12 @@ static int snd_rpi_proto_probe(struct platform_device *pdev)
 		}
 	}
 
-	ret = snd_soc_register_card(&snd_rpi_proto);
+	ret = devm_snd_soc_register_card(&pdev->dev, &snd_rpi_proto);
 	if (ret && ret != -EPROBE_DEFER)
 		dev_err(&pdev->dev,
 				"snd_soc_register_card() failed: %d\n", ret);
 
 	return ret;
-}
-
-
-static int snd_rpi_proto_remove(struct platform_device *pdev)
-{
-	return snd_soc_unregister_card(&snd_rpi_proto);
 }
 
 static const struct of_device_id snd_rpi_proto_of_match[] = {
@@ -143,7 +136,6 @@ static struct platform_driver snd_rpi_proto_driver = {
 		.of_match_table = snd_rpi_proto_of_match,
 	},
 	.probe	  = snd_rpi_proto_probe,
-	.remove	 = snd_rpi_proto_remove,
 };
 
 module_platform_driver(snd_rpi_proto_driver);

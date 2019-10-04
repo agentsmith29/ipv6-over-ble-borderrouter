@@ -1,17 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Texas Instruments System Control Interface Protocol Driver
  *
  * Copyright (C) 2015-2016 Texas Instruments Incorporated - http://www.ti.com/
  *	Nishanth Menon
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed "as is" WITHOUT ANY WARRANTY of any
- * kind, whether express or implied; without even the implied warranty
- * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #define pr_fmt(fmt) "%s: " fmt, __func__
@@ -287,13 +279,13 @@ static void ti_sci_rx_callback(struct mbox_client *cl, void *m)
 
 	/* Is the message of valid length? */
 	if (mbox_msg->len > info->desc->max_msg_size) {
-		dev_err(dev, "Unable to handle %d xfer(max %d)\n",
+		dev_err(dev, "Unable to handle %zu xfer(max %d)\n",
 			mbox_msg->len, info->desc->max_msg_size);
 		ti_sci_dump_header_dbg(dev, hdr);
 		return;
 	}
 	if (mbox_msg->len < xfer->rx_len) {
-		dev_err(dev, "Recv xfer %d < expected %d length\n",
+		dev_err(dev, "Recv xfer %zu < expected %d length\n",
 			mbox_msg->len, xfer->rx_len);
 		ti_sci_dump_header_dbg(dev, hdr);
 		return;
@@ -439,7 +431,7 @@ static inline int ti_sci_do_xfer(struct ti_sci_info *info,
 	/* And we wait for the response. */
 	timeout = msecs_to_jiffies(info->desc->max_rx_timeout_ms);
 	if (!wait_for_completion_timeout(&xfer->done, timeout)) {
-		dev_err(dev, "Mbox timedout in resp(caller: %pF)\n",
+		dev_err(dev, "Mbox timedout in resp(caller: %pS)\n",
 			(void *)_RET_IP_);
 		ret = -ETIMEDOUT;
 	}
@@ -471,9 +463,9 @@ static int ti_sci_cmd_get_revision(struct ti_sci_info *info)
 	struct ti_sci_xfer *xfer;
 	int ret;
 
-	/* No need to setup flags since it is expected to respond */
 	xfer = ti_sci_get_one_xfer(info, TI_SCI_MSG_VERSION,
-				   0x0, sizeof(struct ti_sci_msg_hdr),
+				   TI_SCI_FLAG_REQ_ACK_ON_PROCESSED,
+				   sizeof(struct ti_sci_msg_hdr),
 				   sizeof(*rev_info));
 	if (IS_ERR(xfer)) {
 		ret = PTR_ERR(xfer);
@@ -601,9 +593,9 @@ static int ti_sci_get_device_state(const struct ti_sci_handle *handle,
 	info = handle_to_ti_sci_info(handle);
 	dev = info->dev;
 
-	/* Response is expected, so need of any flags */
 	xfer = ti_sci_get_one_xfer(info, TI_SCI_MSG_GET_DEVICE_STATE,
-				   0, sizeof(*req), sizeof(*resp));
+				   TI_SCI_FLAG_REQ_ACK_ON_PROCESSED,
+				   sizeof(*req), sizeof(*resp));
 	if (IS_ERR(xfer)) {
 		ret = PTR_ERR(xfer);
 		dev_err(dev, "Message alloc failed(%d)\n", ret);
@@ -1862,9 +1854,9 @@ static int ti_sci_probe(struct platform_device *pdev)
 	if (!minfo->xfer_block)
 		return -ENOMEM;
 
-	minfo->xfer_alloc_table = devm_kzalloc(dev,
-					       BITS_TO_LONGS(desc->max_msgs)
-					       * sizeof(unsigned long),
+	minfo->xfer_alloc_table = devm_kcalloc(dev,
+					       BITS_TO_LONGS(desc->max_msgs),
+					       sizeof(unsigned long),
 					       GFP_KERNEL);
 	if (!minfo->xfer_alloc_table)
 		return -ENOMEM;

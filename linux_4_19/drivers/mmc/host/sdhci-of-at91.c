@@ -114,7 +114,8 @@ static void sdhci_at91_set_power(struct sdhci_host *host, unsigned char mode,
 	sdhci_set_power_noreg(host, mode, vdd);
 }
 
-void sdhci_at91_set_uhs_signaling(struct sdhci_host *host, unsigned int timing)
+static void sdhci_at91_set_uhs_signaling(struct sdhci_host *host,
+					 unsigned int timing)
 {
 	if (timing == MMC_TIMING_MMC_DDR52)
 		sdhci_writeb(host, SDMMC_MC1R_DDR, SDMMC_MC1R);
@@ -363,6 +364,9 @@ static int sdhci_at91_probe(struct platform_device *pdev)
 	pm_runtime_enable(&pdev->dev);
 	pm_runtime_set_autosuspend_delay(&pdev->dev, 50);
 	pm_runtime_use_autosuspend(&pdev->dev);
+
+	/* HS200 is broken at this moment */
+	host->quirks2 = SDHCI_QUIRK2_BROKEN_HS200;
 
 	ret = sdhci_add_host(host);
 	if (ret)

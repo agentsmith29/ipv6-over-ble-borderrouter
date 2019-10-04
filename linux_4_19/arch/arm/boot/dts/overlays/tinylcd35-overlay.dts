@@ -24,7 +24,7 @@
 /plugin/;
 
 / {
-	compatible = "brcm,bcm2835", "brcm,bcm2708", "brcm,bcm2709";
+	compatible = "brcm,bcm2835";
 
 	fragment@0 {
 		target = <&spi0>;
@@ -155,7 +155,7 @@
 			status = "okay";
 
 			ds1307: ds1307@68 {
-				compatible = "maxim,ds1307";
+				compatible = "dallas,ds1307";
 				reg = <0x68>;
 				status = "okay";
 			};
@@ -171,8 +171,6 @@
 		__overlay__ {
 			keypad: keypad {
 				compatible = "gpio-keys";
-				#address-cells = <1>;
-				#size-cells = <0>;
 				pinctrl-names = "default";
 				pinctrl-0 = <&keypad_pins>;
 				status = "disabled";

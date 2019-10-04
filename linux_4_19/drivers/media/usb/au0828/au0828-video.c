@@ -67,10 +67,10 @@ static inline void print_err_status(struct au0828_dev *dev,
 
 	switch (status) {
 	case -ENOENT:
-		errmsg = "unlinked synchronuously";
+		errmsg = "unlinked synchronously";
 		break;
 	case -ECONNRESET:
-		errmsg = "unlinked asynchronuously";
+		errmsg = "unlinked asynchronously";
 		break;
 	case -ENOSR:
 		errmsg = "Buffer error (overrun)";
@@ -133,7 +133,7 @@ static void au0828_irq_callback(struct urb *urb)
 		au0828_isocdbg("au0828_irq_callback called: status kill\n");
 		return;
 	default:            /* unknown error */
-		au0828_isocdbg("urb completition error %d.\n", urb->status);
+		au0828_isocdbg("urb completion error %d.\n", urb->status);
 		break;
 	}
 
@@ -217,14 +217,14 @@ static int au0828_init_isoc(struct au0828_dev *dev, int max_packets,
 	dev->isoc_ctl.isoc_copy = isoc_copy;
 	dev->isoc_ctl.num_bufs = num_bufs;
 
-	dev->isoc_ctl.urb = kzalloc(sizeof(void *)*num_bufs,  GFP_KERNEL);
+	dev->isoc_ctl.urb = kcalloc(num_bufs, sizeof(void *),  GFP_KERNEL);
 	if (!dev->isoc_ctl.urb) {
 		au0828_isocdbg("cannot alloc memory for usb buffers\n");
 		return -ENOMEM;
 	}
 
-	dev->isoc_ctl.transfer_buffer = kzalloc(sizeof(void *)*num_bufs,
-					      GFP_KERNEL);
+	dev->isoc_ctl.transfer_buffer = kcalloc(num_bufs, sizeof(void *),
+						GFP_KERNEL);
 	if (!dev->isoc_ctl.transfer_buffer) {
 		au0828_isocdbg("cannot allocate memory for usb transfer\n");
 		kfree(dev->isoc_ctl.urb);
@@ -758,6 +758,9 @@ static int au0828_analog_stream_enable(struct au0828_dev *d)
 
 	dprintk(1, "au0828_analog_stream_enable called\n");
 
+	if (test_bit(DEV_DISCONNECTED, &d->dev_state))
+		return -ENODEV;
+
 	iface = usb_ifnum_to_if(d->usbdev, 0);
 	if (iface && iface->cur_altsetting->desc.bAlternateSetting != 5) {
 		dprintk(1, "Changing intf#0 to alt 5\n");
@@ -839,9 +842,9 @@ int au0828_start_analog_streaming(struct vb2_queue *vq, unsigned int count)
 			return rc;
 		}
 
+		v4l2_device_call_all(&dev->v4l2_dev, 0, video, s_stream, 1);
+
 		if (vq->type == V4L2_BUF_TYPE_VIDEO_CAPTURE) {
-			v4l2_device_call_all(&dev->v4l2_dev, 0, video,
-						s_stream, 1);
 			dev->vid_timeout_running = 1;
 			mod_timer(&dev->vid_timeout, jiffies + (HZ / 10));
 		} else if (vq->type == V4L2_BUF_TYPE_VBI_CAPTURE) {
@@ -861,10 +864,11 @@ static void au0828_stop_streaming(struct vb2_queue *vq)
 
 	dprintk(1, "au0828_stop_streaming called %d\n", dev->streaming_users);
 
-	if (dev->streaming_users-- == 1)
+	if (dev->streaming_users-- == 1) {
 		au0828_uninit_isoc(dev);
+		v4l2_device_call_all(&dev->v4l2_dev, 0, video, s_stream, 0);
+	}
 
-	v4l2_device_call_all(&dev->v4l2_dev, 0, video, s_stream, 0);
 	dev->vid_timeout_running = 0;
 	del_timer_sync(&dev->vid_timeout);
 
@@ -893,8 +897,10 @@ void au0828_stop_vbi_streaming(struct vb2_queue *vq)
 	dprintk(1, "au0828_stop_vbi_streaming called %d\n",
 		dev->streaming_users);
 
-	if (dev->streaming_users-- == 1)
+	if (dev->streaming_users-- == 1) {
 		au0828_uninit_isoc(dev);
+		v4l2_device_call_all(&dev->v4l2_dev, 0, video, s_stream, 0);
+	}
 
 	spin_lock_irqsave(&dev->slock, flags);
 	if (dev->isoc_ctl.vbi_buf != NULL) {
@@ -954,9 +960,9 @@ int au0828_analog_unregister(struct au0828_dev *dev)
 /* This function ensures that video frames continue to be delivered even if
    the ITU-656 input isn't receiving any data (thereby preventing applications
    such as tvtime from hanging) */
-static void au0828_vid_buffer_timeout(unsigned long data)
+static void au0828_vid_buffer_timeout(struct timer_list *t)
 {
-	struct au0828_dev *dev = (struct au0828_dev *) data;
+	struct au0828_dev *dev = from_timer(dev, t, vid_timeout);
 	struct au0828_dmaqueue *dma_q = &dev->vidq;
 	struct au0828_buffer *buf;
 	unsigned char *vid_data;
@@ -978,9 +984,9 @@ static void au0828_vid_buffer_timeout(unsigned long data)
 	spin_unlock_irqrestore(&dev->slock, flags);
 }
 
-static void au0828_vbi_buffer_timeout(unsigned long data)
+static void au0828_vbi_buffer_timeout(struct timer_list *t)
 {
-	struct au0828_dev *dev = (struct au0828_dev *) data;
+	struct au0828_dev *dev = from_timer(dev, t, vbi_timeout);
 	struct au0828_dmaqueue *dma_q = &dev->vbiq;
 	struct au0828_buffer *buf;
 	unsigned char *vbi_data;
@@ -1091,8 +1097,8 @@ static int au0828_v4l2_close(struct file *filp)
 		*/
 		ret = v4l_enable_media_source(vdev);
 		if (ret == 0)
-			v4l2_device_call_all(&dev->v4l2_dev, 0, core,
-					     s_power, 0);
+			v4l2_device_call_all(&dev->v4l2_dev, 0, tuner,
+					     standby);
 		dev->std_set_in_tuner_core = 0;
 
 		/* When close the device, set the usb intf0 into alt0 to free
@@ -1797,7 +1803,7 @@ static const struct v4l2_ioctl_ops video_ioctl_ops = {
 static const struct video_device au0828_video_template = {
 	.fops                       = &au0828_v4l_fops,
 	.release                    = video_device_release_empty,
-	.ioctl_ops 		    = &video_ioctl_ops,
+	.ioctl_ops		    = &video_ioctl_ops,
 	.tvnorms                    = V4L2_STD_NTSC_M | V4L2_STD_PAL_M,
 };
 
@@ -1953,10 +1959,8 @@ int au0828_analog_register(struct au0828_dev *dev,
 	INIT_LIST_HEAD(&dev->vidq.active);
 	INIT_LIST_HEAD(&dev->vbiq.active);
 
-	setup_timer(&dev->vid_timeout, au0828_vid_buffer_timeout,
-		    (unsigned long)dev);
-	setup_timer(&dev->vbi_timeout, au0828_vbi_buffer_timeout,
-		    (unsigned long)dev);
+	timer_setup(&dev->vid_timeout, au0828_vid_buffer_timeout, 0);
+	timer_setup(&dev->vbi_timeout, au0828_vbi_buffer_timeout, 0);
 
 	dev->width = NTSC_STD_W;
 	dev->height = NTSC_STD_H;

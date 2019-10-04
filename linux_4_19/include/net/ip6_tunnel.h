@@ -36,6 +36,10 @@ struct __ip6_tnl_parm {
 	__be32			o_key;
 
 	__u32			fwmark;
+	__u32			index;	/* ERSPAN type II index */
+	__u8			erspan_ver;	/* ERSPAN version */
+	__u8			dir;	/* direction */
+	__u16			hwid;	/* hwid */
 };
 
 /* IPv6 tunnel */
@@ -152,9 +156,12 @@ static inline void ip6tunnel_xmit(struct sock *sk, struct sk_buff *skb,
 	memset(skb->cb, 0, sizeof(struct inet6_skb_parm));
 	pkt_len = skb->len - skb_inner_network_offset(skb);
 	err = ip6_local_out(dev_net(skb_dst(skb)->dev), sk, skb);
-	if (unlikely(net_xmit_eval(err)))
-		pkt_len = -1;
-	iptunnel_xmit_stats(dev, pkt_len);
+
+	if (dev) {
+		if (unlikely(net_xmit_eval(err)))
+			pkt_len = -1;
+		iptunnel_xmit_stats(dev, pkt_len);
+	}
 }
 #endif
 #endif

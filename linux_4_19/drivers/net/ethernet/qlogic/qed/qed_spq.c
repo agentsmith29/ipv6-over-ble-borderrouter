@@ -97,9 +97,7 @@ static int __qed_spq_block(struct qed_hwfn *p_hwfn,
 
 	while (iter_cnt--) {
 		/* Validate we receive completion update */
-		if (READ_ONCE(comp_done->done) == 1) {
-			/* Read updated FW return value */
-			smp_read_barrier_depends();
+		if (smp_load_acquire(&comp_done->done) == 1) { /* ^^^ */
 			if (p_fw_ret)
 				*p_fw_ret = comp_done->fw_return_code;
 			return 0;
@@ -213,7 +211,7 @@ static int qed_spq_fill_entry(struct qed_hwfn *p_hwfn,
 static void qed_spq_hw_initialize(struct qed_hwfn *p_hwfn,
 				  struct qed_spq *p_spq)
 {
-	struct core_conn_context *p_cxt;
+	struct e4_core_conn_context *p_cxt;
 	struct qed_cxt_info cxt_info;
 	u16 physical_q;
 	int rc;
@@ -231,11 +229,11 @@ static void qed_spq_hw_initialize(struct qed_hwfn *p_hwfn,
 	p_cxt = cxt_info.p_cxt;
 
 	SET_FIELD(p_cxt->xstorm_ag_context.flags10,
-		  XSTORM_CORE_CONN_AG_CTX_DQ_CF_EN, 1);
+		  E4_XSTORM_CORE_CONN_AG_CTX_DQ_CF_EN, 1);
 	SET_FIELD(p_cxt->xstorm_ag_context.flags1,
-		  XSTORM_CORE_CONN_AG_CTX_DQ_CF_ACTIVE, 1);
+		  E4_XSTORM_CORE_CONN_AG_CTX_DQ_CF_ACTIVE, 1);
 	SET_FIELD(p_cxt->xstorm_ag_context.flags9,
-		  XSTORM_CORE_CONN_AG_CTX_CONSOLID_PROD_CF_EN, 1);
+		  E4_XSTORM_CORE_CONN_AG_CTX_CONSOLID_PROD_CF_EN, 1);
 
 	/* QM physical queue */
 	physical_q = qed_get_cm_pq_idx(p_hwfn, PQ_FLAGS_LB);
@@ -403,6 +401,11 @@ int qed_eq_completion(struct qed_hwfn *p_hwfn, void *cookie)
 	}
 
 	qed_eq_prod_update(p_hwfn, qed_chain_get_prod_idx(p_chain));
+
+	/* Attempt to post pending requests */
+	spin_lock_bh(&p_hwfn->p_spq->lock);
+	rc = qed_spq_pend_post(p_hwfn);
+	spin_unlock_bh(&p_hwfn->p_spq->lock);
 
 	return rc;
 }
@@ -747,7 +750,7 @@ static int qed_spq_post_list(struct qed_hwfn *p_hwfn,
 	return 0;
 }
 
-static int qed_spq_pend_post(struct qed_hwfn *p_hwfn)
+int qed_spq_pend_post(struct qed_hwfn *p_hwfn)
 {
 	struct qed_spq *p_spq = p_hwfn->p_spq;
 	struct qed_spq_entry *p_ent = NULL;
@@ -795,6 +798,7 @@ int qed_spq_post(struct qed_hwfn *p_hwfn,
 	int rc = 0;
 	struct qed_spq *p_spq = p_hwfn ? p_hwfn->p_spq : NULL;
 	bool b_ret_ent = true;
+	bool eblock;
 
 	if (!p_hwfn)
 		return -EINVAL;
@@ -813,6 +817,11 @@ int qed_spq_post(struct qed_hwfn *p_hwfn,
 	if (rc)
 		goto spq_post_fail;
 
+	/* Check if entry is in block mode before qed_spq_add_entry,
+	 * which might kfree p_ent.
+	 */
+	eblock = (p_ent->comp_mode == QED_SPQ_MODE_EBLOCK);
+
 	/* Add the request to the pending queue */
 	rc = qed_spq_add_entry(p_hwfn, p_ent, p_ent->priority);
 	if (rc)
@@ -830,7 +839,7 @@ int qed_spq_post(struct qed_hwfn *p_hwfn,
 
 	spin_unlock_bh(&p_spq->lock);
 
-	if (p_ent->comp_mode == QED_SPQ_MODE_EBLOCK) {
+	if (eblock) {
 		/* For entries in QED BLOCK mode, the completion code cannot
 		 * perform the necessary cleanup - if it did, we couldn't
 		 * access p_ent here to see whether it's successful or not.
@@ -879,7 +888,6 @@ int qed_spq_completion(struct qed_hwfn *p_hwfn,
 	struct qed_spq_entry	*p_ent = NULL;
 	struct qed_spq_entry	*tmp;
 	struct qed_spq_entry	*found = NULL;
-	int			rc;
 
 	if (!p_hwfn)
 		return -EINVAL;
@@ -937,12 +945,7 @@ int qed_spq_completion(struct qed_hwfn *p_hwfn,
 		 */
 		qed_spq_return_entry(p_hwfn, found);
 
-	/* Attempt to post pending requests */
-	spin_lock_bh(&p_spq->lock);
-	rc = qed_spq_pend_post(p_hwfn);
-	spin_unlock_bh(&p_spq->lock);
-
-	return rc;
+	return 0;
 }
 
 int qed_consq_alloc(struct qed_hwfn *p_hwfn)

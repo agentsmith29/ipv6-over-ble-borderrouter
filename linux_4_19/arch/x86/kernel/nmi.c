@@ -34,6 +34,7 @@
 #include <asm/x86_init.h>
 #include <asm/reboot.h>
 #include <asm/cache.h>
+#include <asm/nospec-branch.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/nmi.h>
@@ -105,7 +106,7 @@ static void nmi_max_handler(struct irq_work *w)
 {
 	struct nmiaction *a = container_of(w, struct nmiaction, irq_work);
 	int remainder_ns, decimal_msecs;
-	u64 whole_msecs = ACCESS_ONCE(a->max_duration);
+	u64 whole_msecs = READ_ONCE(a->max_duration);
 
 	remainder_ns = do_div(whole_msecs, (1000 * 1000));
 	decimal_msecs = remainder_ns / 1000;
@@ -533,6 +534,9 @@ nmi_restart:
 		write_cr2(this_cpu_read(nmi_cr2));
 	if (this_cpu_dec_return(nmi_state))
 		goto nmi_restart;
+
+	if (user_mode(regs))
+		mds_user_clear_cpu_buffers();
 }
 NOKPROBE_SYMBOL(do_nmi);
 

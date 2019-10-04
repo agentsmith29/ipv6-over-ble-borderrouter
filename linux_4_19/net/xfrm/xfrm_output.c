@@ -44,7 +44,7 @@ static int xfrm_skb_check_space(struct sk_buff *skb)
 
 static struct dst_entry *skb_dst_pop(struct sk_buff *skb)
 {
-	struct dst_entry *child = dst_clone(skb_dst(skb)->child);
+	struct dst_entry *child = dst_clone(xfrm_dst_child(skb_dst(skb)));
 
 	skb_dst_drop(skb);
 	return child;
@@ -66,8 +66,7 @@ static int xfrm_output_one(struct sk_buff *skb, int err)
 			goto error_nolock;
 		}
 
-		if (x->props.output_mark)
-			skb->mark = x->props.output_mark;
+		skb->mark = xfrm_smark_get(skb->mark, x);
 
 		err = x->outer_mode->output(x, skb);
 		if (err) {

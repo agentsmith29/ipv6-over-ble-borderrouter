@@ -127,8 +127,8 @@ static struct lapb_cb *lapb_create_cb(void)
 	skb_queue_head_init(&lapb->write_queue);
 	skb_queue_head_init(&lapb->ack_queue);
 
-	init_timer(&lapb->t1timer);
-	init_timer(&lapb->t2timer);
+	timer_setup(&lapb->t1timer, NULL, 0);
+	timer_setup(&lapb->t2timer, NULL, 0);
 
 	lapb->t1      = LAPB_DEFAULT_T1;
 	lapb->t2      = LAPB_DEFAULT_T2;
@@ -182,6 +182,7 @@ int lapb_unregister(struct net_device *dev)
 	lapb = __lapb_devtostruct(dev);
 	if (!lapb)
 		goto out;
+	lapb_put(lapb);
 
 	lapb_stop_t1timer(lapb);
 	lapb_stop_t2timer(lapb);

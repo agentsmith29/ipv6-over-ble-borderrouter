@@ -13,7 +13,7 @@ endif
 
 # check that the output directory actually exists
 ifneq ($(OUTPUT),)
-OUTDIR := $(shell cd $(OUTPUT) && /bin/pwd)
+OUTDIR := $(shell cd $(OUTPUT) && pwd)
 $(if $(OUTDIR),, $(error output directory "$(OUTPUT)" does not exist))
 endif
 
@@ -117,6 +117,7 @@ ifneq ($(silent),1)
 
 	QUIET_CLEAN    = @printf '  CLEAN    %s\n' $1;
 	QUIET_INSTALL  = @printf '  INSTALL  %s\n' $1;
+	QUIET_UNINST   = @printf '  UNINST   %s\n' $1;
   endif
 endif
 

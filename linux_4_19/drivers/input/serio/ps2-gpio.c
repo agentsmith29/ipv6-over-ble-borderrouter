@@ -76,6 +76,7 @@ static void ps2_gpio_close(struct serio *serio)
 {
 	struct ps2_gpio_data *drvdata = serio->port_data;
 
+	flush_delayed_work(&drvdata->tx_work);
 	disable_irq(drvdata->irq);
 }
 
@@ -366,6 +367,7 @@ static int ps2_gpio_probe(struct platform_device *pdev)
 	    gpiod_cansleep(drvdata->gpio_clk)) {
 		dev_err(dev, "GPIO data or clk are connected via slow bus\n");
 		error = -EINVAL;
+		goto err_free_serio;
 	}
 
 	drvdata->irq = platform_get_irq(pdev, 0);

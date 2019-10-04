@@ -1,6 +1,6 @@
 /*
  * Pisound Linux kernel module.
- * Copyright (C) 2016-2017  Vilniaus Blokas UAB, https://blokas.io/pisound
+ * Copyright (C) 2016-2019  Vilniaus Blokas UAB, https://blokas.io/pisound
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -286,9 +286,6 @@ static irqreturn_t data_available_interrupt_handler(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
-static DEFINE_SPINLOCK(spilock);
-static unsigned long spilockflags;
-
 static uint16_t spi_transfer16(uint16_t val)
 {
 	uint8_t txbuf[2];
@@ -333,9 +330,7 @@ static void spi_transfer(const uint8_t *txbuf, uint8_t *rxbuf, int len)
 	transfer.delay_usecs = 10;
 	spi_message_add_tail(&transfer, &msg);
 
-	spin_lock_irqsave(&spilock, spilockflags);
 	err = spi_sync(pisnd_spi_device, &msg);
-	spin_unlock_irqrestore(&spilock, spilockflags);
 
 	if (err < 0) {
 		printe("spi_sync error %d\n", err);
@@ -532,10 +527,10 @@ static void pisnd_spi_gpio_uninit(void)
 
 static int pisnd_spi_gpio_irq_init(struct device *dev)
 {
-	return request_irq(
-		gpiod_to_irq(data_available),
+	return request_threaded_irq(
+		gpiod_to_irq(data_available), NULL,
 		data_available_interrupt_handler,
-		IRQF_TIMER | IRQF_TRIGGER_RISING,
+		IRQF_TIMER | IRQF_TRIGGER_RISING | IRQF_ONESHOT,
 		"data_available_int",
 		NULL
 		);

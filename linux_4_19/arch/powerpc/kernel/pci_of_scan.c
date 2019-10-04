@@ -38,13 +38,15 @@ static u32 get_int_prop(struct device_node *np, const char *name, u32 def)
  * @addr0: value of 1st cell of a device tree PCI address.
  * @bridge: Set this flag if the address is from a bridge 'ranges' property
  */
-static unsigned int pci_parse_of_flags(u32 addr0, int bridge)
+unsigned int pci_parse_of_flags(u32 addr0, int bridge)
 {
 	unsigned int flags = 0;
 
 	if (addr0 & 0x02000000) {
 		flags = IORESOURCE_MEM | PCI_BASE_ADDRESS_SPACE_MEMORY;
 		flags |= (addr0 >> 22) & PCI_BASE_ADDRESS_MEM_TYPE_64;
+		if (flags & PCI_BASE_ADDRESS_MEM_TYPE_64)
+			flags |= IORESOURCE_MEM_64;
 		flags |= (addr0 >> 28) & PCI_BASE_ADDRESS_MEM_TYPE_1M;
 		if (addr0 & 0x40000000)
 			flags |= IORESOURCE_PREFETCH
@@ -369,11 +371,8 @@ static void __of_scan_bus(struct device_node *node, struct pci_bus *bus,
 	pcibios_setup_bus_devices(bus);
 
 	/* Now scan child busses */
-	list_for_each_entry(dev, &bus->devices, bus_list) {
-		if (pci_is_bridge(dev)) {
-			of_scan_pci_bridge(dev);
-		}
-	}
+	for_each_pci_bridge(dev, bus)
+		of_scan_pci_bridge(dev);
 }
 
 /**
