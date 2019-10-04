@@ -8,7 +8,7 @@ Then boot your Pi, plug in Ethernet to give you access to the sources, and log i
 ## Dependencies
 First install Git and the build dependencies:
 
-sudo apt-get install git bc bison flex libssl-dev
+```sudo apt-get install git bc bison flex libssl-dev```
 
 Next get the sources from: https://github.com/agentsmith29/ipv6-over-ble-borderrouter.git
 ```bash
