@@ -8,6 +8,14 @@ SET(PATH_LIBCONFIG ${PROJECT_SOURCE_DIR}/libconfig/lib/)
 SET(PATH_BLUEZ ${PROJECT_SOURCE_DIR}/bluez/lib)
 SET(LIB_PATH ${PROJECT_SOURCE_DIR}/build/lib)
 
+if(APPLE)
+ set(CMAKE_C_COMPILER "gcc")
+set(CMAKE_CXX_COMPILER "g++")
+ #configure_file(machine/endian.h endian.h COPYONLY)
+ INCLUDE_DIRECTORIES("/usr/include/machine/")
+ INCLUDE_DIRECTORIES("/usr/include")
+endif()
+
 
 
 #For die BlueZLib

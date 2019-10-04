@@ -1,4 +1,5 @@
-cd linux
+#!/bin/bash
+cd ./linux_4_19
 
 #make clean
 
